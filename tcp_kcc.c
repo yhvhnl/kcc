@@ -214,25 +214,46 @@ static inline u32 tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE(tp-
 #define KCC_TSO_HIGH_JITTER_THRESH_US  4000  /* TSO burst sizing: jitter above 4ms → double divisor */
 #define KCC_AGG_CONFIDENCE_MAX         1024  /* ACK aggregation confidence score upper bound */
 
-/* ---- KCC FSM Modes --------------------------------------------------- */
-/*
- * KCC state machine mirrors BBRv1 (Cardwell et al. 2016) with four states:
- *
- *   STARTUP   — rapid exponential probing with pacing_gain approx 2.89x.
- *               Exits when full_bw_reached (pipe filled to capacity).
- *
- *   DRAIN     — briefly drains the queue built during STARTUP.
- *               pacing_gain approx 0.35x (less than 1.0).  Exits when
- *               estimated inflight drops to the BDP at 1.0x gain.
- *
- *   PROBE_BW  — steady-state: cycles through a table of pacing gains
- *               (some >1.0x to probe, some =1.0x to cruise, some <1.0x
- *               to drain).  Each phase lasts approx 1 min_rtt.
- *
- *   PROBE_RTT — periodically drains inflight to min_target to obtain
- *               a fresh min_rtt sample.  Triggered when the PROBE_RTT
- *               interval expires without a min_rtt update.
- */
+/* ---- Global Kalman BDP filter constants -------------------------------- */
+#define KCC_KF_CWND_SEGS_MAX       20000 /* max CWND segments from KF injection (safety ceiling) */
+#define KCC_KF_STARTUP_PROTECT_RTTS 8   /* rounds to protect STARTUP from premature full_bw exit */
+/* Chi-squared innovation gate: prevents transient spikes from corrupting
+ * the global bandwidth estimate.  num/den encodes the chi-squared
+ * rejection threshold in fixed-point.
+ *   default: 384/100 → 3.84σ (p ≈ 0.05 for 1 dof)
+ * The bit shifts (INNOV_SHIFT, VAR_SHIFT) provide overflow protection for
+ * the 64-bit product in the (nu² / S) comparison.  The shifts cancel in
+ * the final ratio — they only prevent intermediate overflow. */
+#define KCC_KF_CHI2_NUM_DEFAULT      384 /* chi-squared gate: numerator */
+#define KCC_KF_CHI2_DEN_DEFAULT      100 /* chi-squared gate: denominator */
+ /* Bit-shift based overflow guards for the Kalman update:
+  *   - OVERFLOW_GUARD: rescale P+R to fit in 31 bits before multiplication
+  *   - INNOV_SHIFT:    downscale innovation before squaring (ν² >> 2·shift)
+  *   - VAR_SHIFT:      downscale variance  before ratio  (S >> shift)
+  *  2×INNOV_SHIFT must equal VAR_SHIFT so the shifts cancel in the ratio. */
+#define KCC_KF_OVERFLOW_GUARD   (1ULL << 31) /* max unscaled P+R before fixed-point rescaling */
+#define KCC_KF_INNOV_SHIFT      10           /* innovation scaling shift */
+#define KCC_KF_VAR_SHIFT        (2 * KCC_KF_INNOV_SHIFT) /* variance scaling shift (must = 2*INNOV_SHIFT) */
+
+  /* ---- KCC FSM Modes --------------------------------------------------- */
+  /*
+   * KCC state machine mirrors BBRv1 (Cardwell et al. 2016) with four states:
+   *
+   *   STARTUP   — rapid exponential probing with pacing_gain approx 2.89x.
+   *               Exits when full_bw_reached (pipe filled to capacity).
+   *
+   *   DRAIN     — briefly drains the queue built during STARTUP.
+   *               pacing_gain approx 0.35x (less than 1.0).  Exits when
+   *               estimated inflight drops to the BDP at 1.0x gain.
+   *
+   *   PROBE_BW  — steady-state: cycles through a table of pacing gains
+   *               (some >1.0x to probe, some =1.0x to cruise, some <1.0x
+   *               to drain).  Each phase lasts approx 1 min_rtt.
+   *
+   *   PROBE_RTT — periodically drains inflight to min_target to obtain
+   *               a fresh min_rtt sample.  Triggered when the PROBE_RTT
+   *               interval expires without a min_rtt update.
+   */
 enum kcc_mode {                    /* FSM operating mode, mirrors BBRv1 states */
     KCC_STARTUP = 0,            /* initial rapid probing, high_gain approx 2.89x */
     KCC_DRAIN = 1,            /* drain excess queue after full_bw detected */
@@ -716,6 +737,105 @@ static int kcc_kalman_q_scale_cap = 20;               /* cap on Q adaptation fac
 module_param_cb(kcc_kalman_q_scale_cap, &kcc_param_ops, &kcc_kalman_q_scale_cap, 0644); /* sysctl: kcc_kalman_q_scale_cap */
 static int kcc_kalman_min_samples = 5;                /* min Kalman samples before min_rtt takeover */
 module_param_cb(kcc_kalman_min_samples, &kcc_param_ops, &kcc_kalman_min_samples, 0644); /* sysctl: kcc_kalman_min_samples */
+
+/* ---- Global Kalman BDP filter (cross-connection bandwidth estimation) ---- */
+/*
+ * kcc_kf_enable — Master enable switch for the cross-connection
+ *     Global Kalman BDP filter.  When 0 (default), each connection
+ *     uses its own per-connection Kalman estimate for BDP calculation.
+ *     When 1, the global KF estimate overrides per-connection BDP,
+ *     enabling fair-share bandwidth allocation across all connections
+ *     sharing a bottleneck.  Default 0 (off).
+ */
+static int kcc_kf_enable = 0;                         /* master enable for cross-connection global KF (0=off, 1=on) */
+module_param_cb(kcc_kf_enable, &kcc_param_ops, &kcc_kf_enable, 0644); /* sysctl: kcc_kf_enable */
+/*
+ * kcc_kf_startup_r_pct — Measurement noise R as percentage of the
+ *     measurement during the startup (pre-convergence) phase.  Higher
+ *     R values make the KF trust the model more than new measurements,
+ *     preventing wild swings before the estimate has stabilized.
+ *     Default 20 (%).
+ */
+static int kcc_kf_startup_r_pct = 20;                 /* measurement noise R pct for startup phase */
+module_param_cb(kcc_kf_startup_r_pct, &kcc_param_ops, &kcc_kf_startup_r_pct, 0644); /* sysctl: kcc_kf_startup_r_pct */
+/*
+ * kcc_kf_steady_r_pct — Measurement noise R as percentage of the
+ *     measurement during steady-state (post-convergence) operation.
+ *     Lower than startup R to allow faster reaction to genuine
+ *     bandwidth changes once the filter has converged.
+ *     Default 5 (%).
+ */
+static int kcc_kf_steady_r_pct = 5;                   /* measurement noise R pct for steady state */
+module_param_cb(kcc_kf_steady_r_pct, &kcc_param_ops, &kcc_kf_steady_r_pct, 0644); /* sysctl: kcc_kf_steady_r_pct */
+/*
+ * kcc_kf_q_shift — Process noise shift.  Q = 1 << shift.
+ *     Controls how quickly the KF "forgets" old estimates in favour
+ *     of new measurements.  Higher shifts increase Q, making the
+ *     filter more responsive to genuine bandwidth changes at the
+ *     cost of estimate smoothness.  Default 20 (Q = 1,048,576).
+ */
+static int kcc_kf_q_shift = 20;                       /* process noise shift (Q = 1 << shift), higher = more responsive */
+module_param_cb(kcc_kf_q_shift, &kcc_param_ops, &kcc_kf_q_shift, 0644); /* sysctl: kcc_kf_q_shift */
+/*
+ * kcc_kf_chi2_num — Chi-squared innovation gate numerator.
+ * kcc_kf_chi2_den — Chi-squared innovation gate denominator.
+ *     Measurements whose squared innovation exceeds the gate
+ *     threshold (num/den) are rejected as outliers, preventing
+ *     transient spikes from corrupting the global estimate.
+ *     Default 384/100 = 3.84 (chi-squared 95% confidence, 1 DOF).
+ */
+static int kcc_kf_chi2_num = 384;                     /* chi2 innovation gate numerator (outlier rejection) */
+module_param_cb(kcc_kf_chi2_num, &kcc_param_ops, &kcc_kf_chi2_num, 0644); /* sysctl: kcc_kf_chi2_num */
+static int kcc_kf_chi2_den = 100;                     /* chi2 innovation gate denominator (outlier rejection) */
+module_param_cb(kcc_kf_chi2_den, &kcc_param_ops, &kcc_kf_chi2_den, 0644); /* sysctl: kcc_kf_chi2_den */
+/*
+ * kcc_kf_discount_num — Global fair-share discount numerator.
+ * kcc_kf_discount_den — Global fair-share discount denominator.
+ *
+ * When multiple connections share a bottleneck link, the global KF
+ * estimate of total available BW is discounted by this ratio before
+ * being injected into each new connection, preventing over-allocation
+ * across competing flows.
+ *
+ * --- Dessert-speed design rationale ---
+ *
+ * The effective initial-speed coefficient is:
+ *
+ *   coeff = (discount_ratio) / high_gain
+ *         = (num / den) / 2.89
+ *
+ * where high_gain ≈ 2.89 is the BBR STARTUP pacing multiplier.
+ * This places the initial injection at a conservatively low fraction
+ * of the estimated fair-share bandwidth: enough to accelerate
+ * cold-start meaningfully, low enough that STARTUP's 2.89× gain
+ * does not overshoot into bufferbloat within the first 2–4 RTTs.
+ *
+ * Note that in practice the first 1–2 RTTs cannot physically saturate
+ * even a low dessert speed: tcp_write_xmit enforces an initial CWND
+ * of TCP_INIT_CWND (10 segments, ≈ 15 KB) for every new connection.
+ * CWND only grows when remote ACKs arrive, so the dessert speed is
+ * an upper bound on pacing rate — the actual throughput is CWND-limited
+ * until sufficient ACKs have been received to open the window.
+ *
+ * The adjustable range is 35–75 (num / den = 35–75% of fair share):
+ *
+ *   num | coeff  | characteristic
+ *   ----|--------|-------------------------------
+ *    35 | 12.1%  | maximum safety, worst-path
+ *    50 | 17.3%  | centre axis (default)
+ *    75 | 25.9%  | mathematical dessert sweet spot
+ *    80 | 27.6%  | mathematical rate ceiling (should not exceed)
+ *
+ * At 50 % centre: 50 / 100 / 2.89 ≈ 17.3 %.  This is the midpoint
+ * between "too slow to help" and "too fast to be safe" — the KCC
+ * state machine can adjust up or down within 2–4 RTTs from here.
+ * Tune toward 35 for highly contended or fragile paths, toward 75
+ * for clean high-BDP links.  Default 50.
+ */
+static int kcc_kf_discount_num = 50;                  /* dessert-speed numerator: percent of fair-share BW */
+module_param_cb(kcc_kf_discount_num, &kcc_param_ops, &kcc_kf_discount_num, 0644); /* sysctl: kcc_kf_discount_num */
+static int kcc_kf_discount_den = 100;                 /* fair-share discount denominator (prevent over-allocation) */
+module_param_cb(kcc_kf_discount_den, &kcc_param_ops, &kcc_kf_discount_den, 0644); /* sysctl: kcc_kf_discount_den */
 
 /* ---- RTT sample bounds (us, int) ------------------------------------- */
 /*
@@ -1685,6 +1805,14 @@ static u32 kcc_bw_rt_cycle_len_val;                         /* clamped BW cycle 
 static u32 kcc_cwnd_min_target_val;                          /* clamped cwnd min target (computed at module init) */
 static u32 kcc_sndbuf_expand_factor_val;                     /* clamped sndbuf expand factor (computed at module init) */
 static u32 kcc_ack_epoch_max_val;                            /* clamped ACK epoch max (computed at module init) */
+static u32 kcc_kf_enable_val;                            /* cached global KF enable flag [0,1] (computed at module init) */
+static u32 kcc_kf_startup_r_pct_val;                     /* cached startup-phase measurement noise R pct (computed at module init) */
+static u32 kcc_kf_steady_r_pct_val;                      /* cached steady-state measurement noise R pct (computed at module init) */
+static u32 kcc_kf_q_shift_val;                           /* cached process noise shift (Q = 1 << shift) (computed at module init) */
+static u64 kcc_kf_chi2_num_val;                          /* cached chi2 innovation gate numerator (computed at module init) */
+static u64 kcc_kf_chi2_den_val;                          /* cached chi2 innovation gate denominator (computed at module init) */
+static u32 kcc_kf_discount_num_val;                      /* cached fair-share discount numerator (computed at module init) */
+static u32 kcc_kf_discount_den_val;                      /* cached fair-share discount denominator (computed at module init) */
 
 /*
  * kcc_init_module_params - Validate all raw module parameters against
@@ -2213,6 +2341,23 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Rebuild the cycle gain table from the (possibly updated) arrays */
     kcc_rebuild_gain_table();                                                 /* recompute kcc_cycle_gain_table[] */
 
+    kcc_kf_enable = clamp(kcc_kf_enable, 0, 1);                              /* global KF enable [0, 1] */
+    kcc_kf_startup_r_pct = clamp(kcc_kf_startup_r_pct, 1, 100);              /* startup R pct [1, 100] */
+    kcc_kf_steady_r_pct = clamp(kcc_kf_steady_r_pct, 1, 100);                /* steady R pct [1, 100] */
+    kcc_kf_q_shift = clamp(kcc_kf_q_shift, 0, 30);                           /* process noise shift [0, 30] */
+    kcc_kf_chi2_num = clamp(kcc_kf_chi2_num, 1, 100000);                     /* chi2 num [1, 100k] */
+    kcc_kf_chi2_den = clamp(kcc_kf_chi2_den, 1, 100000);                     /* chi2 den [1, 100k] */
+    kcc_kf_discount_num = clamp(kcc_kf_discount_num, 0, 100);                /* discount num [0, 100] */
+    kcc_kf_discount_den = clamp(kcc_kf_discount_den, 1, 100000);             /* discount den [1, 100k] */
+    kcc_kf_enable_val = (u32)kcc_kf_enable;                                  /* publish KF enable */
+    kcc_kf_startup_r_pct_val = (u32)kcc_kf_startup_r_pct;                    /* publish startup R pct */
+    kcc_kf_steady_r_pct_val = (u32)kcc_kf_steady_r_pct;                      /* publish steady R pct */
+    kcc_kf_q_shift_val = (u32)kcc_kf_q_shift;                                /* publish Q shift */
+    kcc_kf_chi2_num_val = (u64)kcc_kf_chi2_num;                              /* publish chi2 num */
+    kcc_kf_chi2_den_val = (u64)kcc_kf_chi2_den;                              /* publish chi2 den */
+    kcc_kf_discount_num_val = (u32)kcc_kf_discount_num;                      /* publish discount num */
+    kcc_kf_discount_den_val = (u32)kcc_kf_discount_den;                      /* publish discount den */
+
     kcc_bw_rt_cycle_len_val = kcc_bw_rt_cycle_len;                 /* publish BW RT cycle length */
     kcc_cwnd_min_target_val = kcc_cwnd_min_target;                 /* publish min cwnd target */
     kcc_sndbuf_expand_factor = clamp(kcc_sndbuf_expand_factor, 2, 100);       /* clamp sndbuf factor */
@@ -2220,6 +2365,20 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_ack_epoch_max = clamp(kcc_ack_epoch_max, 65536, 0x7FFFFFFF);         /* clamp epoch cap [64K, 2G] */
     kcc_ack_epoch_max_val = (u32)kcc_ack_epoch_max;                 /* publish epoch cap */
 }                                                                             /* kcc_init_module_params */
+
+/* ---- Global Kalman BDP atomic state (cross-connection) ---------------- */
+/*
+ * KF atomic globals: shared across all KCC connections on this host.
+ * Using atomic types because the Kalman filter runs in softirq context
+ * without per-connection locks — the estimation target (available
+ * bandwidth on the bottleneck) is a shared resource.
+ *   kcc_kf_x      — posterior state estimate (BW_UNIT)
+ *   kcc_kf_P      — posterior error covariance
+ *   kcc_kf_active — 1 = filter has been seeded with at least one sample
+ */
+static atomic64_t kcc_kf_x = ATOMIC64_INIT(0);          /* global available BW estimate (BW_UNIT) */
+static atomic64_t kcc_kf_P = ATOMIC64_INIT(0);          /* error covariance (initial uncertainty) */
+static atomic_t kcc_kf_active = ATOMIC_INIT(0);         /* 1 = filter has been seeded (cold-start guard) */
 
 /* ---- Forward Declarations -------------------------------------------- */
 static void kcc_check_probe_rtt_done(struct sock* sk);                        /* forward: check PROBE_RTT exit */
@@ -2246,6 +2405,10 @@ u32 kcc_sndbuf_expand(struct sock* sk);                                         
 u32 kcc_undo_cwnd(struct sock* sk);                                               /* cwnd undo on spurious loss */
 u32 kcc_ssthresh(struct sock* sk);                                                 /* ssthresh query */
 void kcc_set_state(struct sock* sk, u8 new_state);                                  /* CA state transition handler */
+/* Global Kalman BDP filter (cross-connection bandwidth estimation) forward declarations */
+static u64 kcc_kf_compute_R(u64 z, u32 pct);                   /* compute measurement noise covariance */
+static u64 kcc_kf_update(u64 z, u32 r_pct, bool check);        /* one-step Kalman BW update */
+static u64 kcc_kf_get_init_bw(struct sock* sk);                  /* bootstrapped initial BW */
 
 /* ---- Extended State Helpers ------------------------------------------- */
 
@@ -2434,6 +2597,29 @@ static void kcc_set_pacing_rate(struct sock* sk, u64 bw, u32 gain)            /*
     struct tcp_sock* tp = tcp_sk(sk);                                        /* get TCP socket state */
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                          /* get KCC CA state */
     u64 rate = kcc_bw_to_pacing_rate(sk, bw, gain);                            /* compute target pacing rate */
+
+    /* Step 3 (Global Kalman BDP): pacing-rate floor during STARTUP.
+     * Even with the defensive floor in kcc_update_bw, kcc_set_pacing_rate
+     * can still produce a low pacing rate if the input bw is the global
+     * floor value but the gain is below BBR_UNIT (e.g. during LT BW fallback
+     * or DRAIN).  This guard computes the global-Kalman bootstrap rate at
+     * BBR_UNIT gain and enforces it as a hard floor during STARTUP.
+     * NOTE: inlined instead of calling kcc_kf_get_init_bw() because the
+     * latter contains a cwnd-sanity guard that rejects calls after cwnd
+     * has already been expanded by Step 1. */
+    if (kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) {   /* KF active + STARTUP */
+        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);                               /* read global fair-share estimate */
+        if (kf_bw > 0) {                                                         /* valid estimate */
+            u64 init_bw = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply safety discount */
+            u64 kf_rate;                                                         /* neutral-gain KF pacing rate */
+
+            init_bw = init_bw * BBR_UNIT / (u64)kcc_high_gain_val;               /* gain-compensate: ÷ high_gain */
+            kf_rate = kcc_bw_to_pacing_rate(sk, init_bw, BBR_UNIT);               /* compute neutral-gain KF rate */
+            if (rate < kf_rate) {                                                     /* computed rate below KF floor */
+                rate = kf_rate;                                                       /* enforce global-Kalman pacing floor */
+            }
+        }
+    }
 
     /* Bootstrap: on the first SRTT sample, initialize pacing from RTT */
     if (unlikely(!kcc->has_seen_rtt && tp->srtt_us)) {                        /* first SRTT sample available */
@@ -3943,6 +4129,23 @@ static void kcc_update_bw(struct sock* sk, const struct rate_sample* rs,        
     /* Instantaneous bandwidth: delivered segments * BW_UNIT / interval_us */
     bw = div_u64((u64)rs->delivered * BW_UNIT, rs->interval_us);                                           /* compute instant bandwidth */
 
+    /* Step 2 (Global Kalman BDP): defensive floor during STARTUP.
+     * The first few RTTs of a new connection produce low-bandwidth
+     * delivery-rate samples because the pipe hasn't filled yet.  Without
+     * a floor, these dirty samples overwrite the global Kalman injection.
+     * The floor is init_bw (fair × discount × BBR_UNIT ÷ high_gain), not
+     * the raw KF estimate — using the raw value would inflate max_bw and
+     * cause overdosing when STARTUP high_gain is applied. */
+    if (kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) { /* KF active + STARTUP mode */
+        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);                               /* read global fair-share estimate */
+        u64 floor_bw = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply safety discount */
+
+        floor_bw = floor_bw * BBR_UNIT / (u64)kcc_high_gain_val;                 /* gain-compensate: ÷ high_gain */
+        if (bw < floor_bw) {                                                     /* raw bw below defensive floor */
+            bw = floor_bw;                                                       /* enforce global-Kalman floor */
+        }
+    }
+
     /* BBR rule: if not app-limited OR new bw >= existing max, update sliding max.
      * App-limited samples are excluded unless they record a new peak. */
     if (!rs->is_app_limited || bw >= kcc_max_bw(sk)) {                                                       /* acceptable sample */
@@ -4001,6 +4204,30 @@ static void kcc_check_full_bw_reached(struct sock* sk,                          
 {
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                   /* get KCC CA state */
     u32 bw_thresh;                                                                       /* bandwidth growth threshold */
+
+    /* KCC+ Global Kalman BDP guard: must run BEFORE the is_app_limited
+     * early-return below.  The first few ACKs during iperf3 (control
+     * message exchange) are app-limited — without this guard, the
+     * full_bw_cnt would tick each round and force STARTUP→DRAIN before
+     * any bulk data is sent.  Resetting full_bw_cnt here prevents the
+     * premature mode transition.
+     *
+     * Guard: if max_bw is still at or above the KF floor (init_bw),
+     * the pipe has not yet been filled — reset full_bw_cnt to zero
+     * and keep STARTUP running. */
+    if (kcc->round_start && kcc->rtt_cnt < KCC_KF_STARTUP_PROTECT_RTTS &&          /* early startup rounds */
+        kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) { /* KF active + STARTUP */
+        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);                               /* read global fair-share estimate */
+        if (kf_bw > 0) {                                                         /* valid estimate */
+            u64 init_floor = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply discount */
+            init_floor = init_floor * BBR_UNIT / (u64)kcc_high_gain_val;         /* gain-compensate */
+            if (kcc_max_bw(sk) >= (u32)init_floor) {                             /* max_bw still at/above KF floor */
+                kcc->full_bw = kcc_max_bw(sk);                                   /* record current peak */
+                kcc->full_bw_cnt = 0;                                            /* reset stagnation counter */
+                return;                                                          /* keep STARTUP: pipe not yet full */
+            }
+        }
+    }
 
     if (likely(kcc_full_bw_reached(sk) || !kcc->round_start || rs->is_app_limited)) {             /* skip if already full or invalid */
         return; /* early return */
@@ -5673,6 +5900,229 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
         }
     }
 }
+/* ---- Global Kalman BDP startup (cross-connection init_bw) ----------- */
+/*
+ * Global Kalman-filtered bandwidth estimation.
+ *
+ * All connections on this host share a single Kalman filter that tracks
+ * the steady-state available bandwidth.  Each PROBE_BW cruise-phase
+ * sample (pacing_gain == BBR_UNIT) feeds this filter.  New connections
+ * query kcc_kf_get_init_bw() to obtain a bootstrapped bandwidth estimate,
+ * enabling immediate high-speed startup without the multi-RTT ramp-up
+ * penalty of cold-start TCP.
+ *
+ * Architecture:
+ *   kcc_kf_update()       — feed a BW sample (BW_UNIT) into the filter
+ *   kcc_kf_get_init_bw()  — return the fair-share, gain-compensated
+ *                            initial bandwidth for a new connection
+ *
+ * State is global (atomic64) because the estimation target — available
+ * bandwidth on the bottleneck — is a shared resource across connections.
+ */
+
+ /*
+  * kcc_kf_compute_R - Compute measurement noise covariance for the
+  * Global Kalman BDP filter.
+  * @z:   bandwidth sample in BW_UNIT units.
+  * @pct: noise percentage (e.g. 5 for 5% of z).
+  *
+  * R = (z * pct / 100)^2
+  *
+  * The square models measurement noise as proportional to signal
+  * magnitude — at higher bandwidths the absolute measurement jitter
+  * is larger (heteroscedastic noise model, Kalman 1960).
+  */
+static u64 kcc_kf_compute_R(u64 z, u32 pct)                             /* compute measurement noise covariance */
+{
+    u64 r = z * (u64)pct / KCC_PCT_BASE;                                     /* linear noise: z * pct/100 */
+    return r * r;                                                            /* squared => variance (BW_UNIT)^2 */
+}
+
+/*
+ * kcc_kf_update - Feed a bandwidth sample into the Global Kalman BDP
+ * filter using a one-dimensional random-walk model (Kalman 1960).
+ * @z:      bandwidth sample in BW_UNIT units.
+ * @r_pct:  measurement noise percentage (e.g. 5 for 5% of z).
+ * @check:  if true, apply chi-squared innovation gate to reject
+ *           transient upward spikes.
+ *
+ * Returns the updated state estimate x (BW_UNIT).
+ *
+ * State variables (global atomic64_t / atomic_t):
+ *   kcc_kf_x      — estimated available bandwidth (BW_UNIT)
+ *   kcc_kf_P      — error covariance
+ *   kcc_kf_active — 1 = filter has been seeded
+ *
+ * Model:
+ *   Predict:  x_{k|k-1} = x_{k-1}          (random walk, state constant)
+ *             P_{k|k-1} = P_{k-1} + Q       (add process noise)
+ *   Update:   K = P / (P + R)               (Kalman gain)
+ *             x = x + K * (z - x)            (innovation-weighted update)
+ *             P = (1 - K) * P               (Joseph form covariance)
+ *
+ * Equivalent algebraic form used here (avoids computing K explicitly):
+ *             x = (x * R + z * P) / (P + R)
+ *             P = (P * R) / (P + R)
+ *
+ * Fixed-point rescaling prevents 64-bit overflow when P+R exceeds
+ * 2^31, using bit-shift scaling (INNOV_SHIFT / VAR_SHIFT = 2× cancel).
+ */
+static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW sample into global Kalman filter */
+{                                                                          /* begin one-step Kalman filter */
+    u64 P = atomic64_read(&kcc_kf_P);                                        /* load current error covariance */
+    u64 x = atomic64_read(&kcc_kf_x);                                        /* load current state estimate */
+    u64 R = kcc_kf_compute_R(z, r_pct);                                      /* compute measurement noise R */
+    u32 shift = 0;                                                           /* bit-shift accumulator for overflow rescaling */
+    u64 Pcopy, Rcopy, denom;                                                 /* local copies for rescaling; common denominator */
+    s64 delta;                                                               /* signed innovation for chi-squared check */
+
+    /* Predict step: P = P + Q  (random-walk process noise) */
+    P += (1ULL << kcc_kf_q_shift_val);                                       /* add Q = 2^q_shift to covariance */
+
+    /* First sample: seed the filter (cold start) */
+    if (unlikely(!atomic_read(&kcc_kf_active))) {                            /* filter not yet seeded */
+        atomic64_set(&kcc_kf_x, z);                                          /* seed state with first sample */
+        atomic64_set(&kcc_kf_P, max(R, 1ULL));                               /* seed covariance, floor at 1 */
+        atomic_set(&kcc_kf_active, 1);                                       /* mark filter as active */
+        return z;                                                            /* return first estimate = sample */
+    }
+
+    /* Chi-squared innovation gate: reject outliers in BOTH directions.
+     * A transient spike OR dip should not permanently distort the global
+     * steady-state estimate shared across all connections.  The gate
+     * compares (innovation² / expected_variance) against a chi-squared
+     * threshold — rejecting samples where the deviation is statistically
+     * implausible given the filter's current uncertainty P+R.
+     *
+     * For genuine bandwidth changes (e.g. VPS tenant contention), the
+     * filter naturally tracks: as x drifts toward the new steady state,
+     * the innovation for subsequent samples shrinks and passes the gate
+     * within 2–4 rounds. */
+    if (check) {                                                             /* chi-squared gate enabled */
+        u64 nu2;                                                             /* innovation magnitude (squared later) */
+        u64 S;                                                               /* total uncertainty = P + R */
+
+        delta = (s64)z - (s64)x;                                             /* signed innovation: z - x */
+        nu2 = (u64)(delta < 0 ? -delta : delta);                             /* absolute innovation magnitude */
+        S = P + R;                                                           /* total uncertainty = P + R */
+        if (S > 0) {                                                         /* guard zero division */
+            nu2 = (nu2 >> KCC_KF_INNOV_SHIFT) * (nu2 >> KCC_KF_INNOV_SHIFT); /* downscale innovation, then square */
+            S >>= KCC_KF_VAR_SHIFT;                                          /* downscale total uncertainty */
+            if (S > 0 && nu2 / S >                                           /* chi-squared test: nu²/S > threshold */
+                kcc_kf_chi2_num_val / kcc_kf_chi2_den_val) {                 /*   default 384/100 = 3.84 (p≈0.05) */
+                return x;                                                    /* reject outlier, keep old estimate */
+            }
+        }
+    }
+
+    /* Fixed-point rescaling: copy P and R onto the stack for 64-bit
+     * overflow-safe arithmetic.  If max(P, R, P+R) threatens to exceed
+     * 2^31, right-shift all components (halving precision) until safe. */
+    Pcopy = P;                                                               /* snapshot P for rescaling */
+    Rcopy = R;                                                               /* snapshot R for rescaling */
+    {
+        u64 max_v = Pcopy;                                                   /* init: track largest component */
+        if (Rcopy > max_v) {                                                 /* R is larger */
+            max_v = Rcopy;                                                   /* update max to R */
+        }
+
+        if (Pcopy + Rcopy > max_v) {                                         /* P+R is the largest */
+            max_v = Pcopy + Rcopy;                                           /* update max to P+R */
+        }
+
+        /* Fixed-point rescaling: if max(P, R, P+R) threatens to overflow
+         * when multiplied in the Kalman update, right-shift all components
+         * (halving precision) until the largest fits below the guard. */
+        while (max_v >= KCC_KF_OVERFLOW_GUARD) {                             /* component(s) too large */
+            Pcopy >>= 1; Rcopy >>= 1; max_v >>= 1; shift++;                  /* halve all components, count shifts */
+        }
+    }
+
+    denom = Pcopy + Rcopy;                                                   /* denominator = P + R (Kalman weight normaliser) */
+    if (denom == 0) {                                                        /* guard against zero denominator */
+        return x;                                                            /* cannot update, keep old estimate */
+    }
+
+    /* Kalman update (algebraic form, no explicit gain K):
+     *   x = (x*R + z*P) / (P+R)     weighted blend of prior and measurement
+     *   P = (P*R) / (P+R)           posterior covariance (Joseph form) */
+    x = (x * Rcopy + z * Pcopy) / denom;                                     /* innovation-weighted state update */
+    P = Pcopy * Rcopy / denom;                                               /* posterior covariance update */
+
+    /* Recover precision: undo any right-shift applied during rescaling */
+    if (shift > 0) {                                                         /* precision was lost */
+        P <<= shift;                                                         /* restore full-scale covariance */
+    }
+
+    /* Covariance floor: enforce minimum P ≥ Q to prevent lock-in.
+     * Without this floor, after many updates P → 0 and the filter
+     * ignores new measurements entirely (Kalman gain → 0). */
+    {
+        u64 q = 1ULL << kcc_kf_q_shift_val;                                  /* process noise Q = 2^q_shift */
+        if (P < q) {                                                         /* below floor */
+            P = q;                                                           /* floor covariance at Q */
+        }
+    }
+
+    /* Store updated global state.  Only update when x > 0 because a
+     * zero estimate provides no useful bandwidth floor. */
+    if (x > 0) {                                                             /* valid estimate (positive BW) */
+        atomic64_set(&kcc_kf_x, x);                                          /* publish new bandwidth estimate */
+        atomic64_set(&kcc_kf_P, P);                                          /* publish new covariance */
+    }
+    return x;                                                                /* return updated estimate to caller */
+}
+
+/*
+ * kcc_kf_get_init_bw - Return the fair-share, gain-compensated initial
+ * bandwidth estimate for a new connection.
+ * @sk: TCP socket (for cwnd/rate sanity checks).
+ *
+ * Returns a bandwidth estimate in BW_UNIT that a new connection should
+ * use for initial pacing and cwnd seeding.  Returns 0 if:
+ *   - Global Kalman BDP is disabled (kcc_kf_enable == 0)
+ *   - The estimate is below the local cwnd-derived bandwidth floor
+ *     (indicating the global estimate has drifted below the connection's
+ *     already-probed capacity — the local path is faster)
+ *
+ * The estimate is discounted (kcc_kf_discount_num/den) and divided by
+ * high_gain so that the caller can multiply by BBR_UNIT (neutral gain)
+ * for a conservative initial pacing rate that doesn't overshoot the
+ * global fair-share bottleneck.
+ */
+static u64 kcc_kf_get_init_bw(struct sock* sk)                   /* compute bootstrapped initial BW for new conn */
+{
+    struct tcp_sock* tp = tcp_sk(sk);                                    /* get TCP socket state */
+    u64 fair, init_bw;                                                   /* fair-share estimate; discounted init BW */
+
+    /* Guards: return 0 if KF disabled or not yet ready */
+    if (!kcc_kf_enable_val || !atomic_read(&kcc_kf_active)) {              /* KF disabled or never seeded */
+        return 0;                                                        /* no estimate available */
+    }
+
+    fair = (u64)atomic64_read(&kcc_kf_x);                                /* read global fair-share estimate */
+    if (fair == 0) {                                                     /* estimate is zero */
+        return 0;                                                        /* no useful information */
+    }
+
+    /* Discount and gain-compensate:
+     *   init_bw = fair * discount_num / discount_den
+     *           * BBR_UNIT / high_gain
+     * The discount prevents overcommitment; the ÷high_gain allows
+     * the caller to apply neutral gain without overdosing. */
+    init_bw = fair * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val;  /* apply safety discount */
+    init_bw = init_bw * BBR_UNIT / (u64)kcc_high_gain_val;                         /* gain-compensate: divide out high_gain */
+
+    /* Local BW check: if the connection's own cwnd/RTT already exceeds
+     * the global estimate, the local path is faster — return 0 to let
+     * the connection probe on its own without external guidance. */
+    if (init_bw < (u64)tcp_snd_cwnd(tp) * (u64)BBR_UNIT / max_t(u32, tp->srtt_us >> 3, 1U)) { /* local BW > global estimate */
+        return 0;                                                        /* global estimate is too conservative */
+    }
+
+    return init_bw;                                                      /* return gain-compensated init BW */
+}
+
 /* ---- Main Per-ACK Entry Point ----------------------------------------- */
 
 /*
@@ -5733,6 +6183,22 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)          
         }
     }
 
+    /* Global Kalman BDP: feed PROBE_BW cruise-phase bandwidth samples
+     * into the cross-connection filter.  Cruise phase (gain == BBR_UNIT)
+     * provides the cleanest signal of true available bandwidth — no
+     * 1.25× overshoot or 0.75× undershoot.  Round boundaries gate
+     * feeding to one sample per RTT for numerical stability. */
+    if (kcc_kf_enable_val && kcc->round_start &&                                 /* KF enabled + round boundary */
+        kcc->mode == KCC_PROBE_BW && kcc->pacing_gain == BBR_UNIT && rs->interval_us > 0) {  /* cruise phase, valid interval */
+        u64 bw = (u64)rs->delivered * BW_UNIT / (u64)rs->interval_us;            /* compute instantaneous BW from rate sample */
+        if (!atomic_read(&kcc_kf_active)) {                                      /* filter not yet seeded */
+            kcc_kf_update(bw, (u32)kcc_kf_startup_r_pct_val, false);            /* seed with startup R pct, no chi2 gate */
+        }
+        else {                                                                   /* filter already active */
+            kcc_kf_update(bw, (u32)kcc_kf_steady_r_pct_val, true);              /* feed with steady R pct, chi2 gate ON */
+        }
+    }
+
     kcc_update_model(sk, rs, ext);                                                                   /* full per-ACK model update */
 
     kcc_apply_cwnd_constraints(sk, ext);                                                              /* loss/qdelay-based cap on cwnd_gain */
@@ -5778,11 +6244,43 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
     /* Bootstrap min_rtt_us from TCP stack's 3WHS measurement, matching BBR's
      * bbr->min_rtt_us = tcp_min_rtt(tp).  Without this, kcc_bdp() returns
      * TCP_INIT_CWND (~10) until the first RTT sample arrives, starving cwnd. */
-    kcc->min_rtt_us = tcp_min_rtt(tcp_sk(sk));                                     /* use stack's handshake RTT measurement */
+    kcc->min_rtt_us = tcp_min_rtt(tcp_sk(sk));
+    /* If rtt_min hasn't been seeded yet (returns 0 on some kernel versions),
+     * fall back to the 3WHS SRTT which IS available at cc init time. */
+    if (kcc->min_rtt_us == 0) {
+        struct tcp_sock* tp = tcp_sk(sk);
+        kcc->min_rtt_us = tp->srtt_us ? tp->srtt_us >> 3 : USEC_PER_MSEC;
+    }
     kcc->min_rtt_stamp = tcp_jiffies32;                                                            /* set initial min_rtt timestamp */
 
     kcc_init_pacing_rate_from_rtt(sk);                                                              /* initial pacing rate from RTT+cwnd */
     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);                       /* enable pacing, preserve if already set */
+
+    /* Step 1 (Global Kalman BDP): inject cross-connection bandwidth
+     * estimate to bootstrap this connection at line rate, bypassing the
+     * multi-RTT cold-start ramp-up penalty.  kcc_kf_get_init_bw() returns
+     * a gain-compensated value (already ÷ high_gain) so STARTUP's
+     * 2.89× gain on the next pacing call hits the fair-share estimate. */
+    if (kcc_kf_enable_val && atomic_read(&kcc_kf_active)) {                     /* KF enabled and active */
+        u64 init_bw = kcc_kf_get_init_bw(sk);                                   /* get gain-compensated init BW */
+        if (init_bw > 0) {                                                      /* valid estimate available */
+            struct tcp_sock* tp = tcp_sk(sk);                                    /* get TCP socket state */
+            /* Seed the bandwidth tracker with the global estimate */
+            minmax_running_max(&kcc->bw, kcc_bw_rt_cycle_len_val, 0, (u32)init_bw); /* seed sliding-window max with KF estimate */
+            /* Pacing: neutral gain (BBR_UNIT).  STARTUP will apply
+             * high_gain on the first kcc_set_pacing_rate() call. */
+            WRITE_ONCE(sk->sk_pacing_rate, kcc_bw_to_pacing_rate(sk, init_bw, BBR_UNIT)); /* set initial pacing rate (neutral gain) */
+            /* CWND: BDP from the pre-gain init_bw.  Use the standard KCC
+             * BDP function with neutral gain for a conservative initial
+             * window that doesn't overshoot the bottleneck. */
+            {
+                u32 init_cwnd = kcc_bdp(sk, (u32)init_bw, BBR_UNIT, NULL);     /* BDP at neutral gain */
+                init_cwnd = clamp_t(u32, init_cwnd, TCP_INIT_CWND, KCC_KF_CWND_SEGS_MAX); /* clamp to valid range */
+                tcp_snd_cwnd_set(tp, init_cwnd);                                /* seed cwnd with KF-guided BDP */
+            }
+            kcc->has_seen_rtt = 1;                                              /* mark: bandwidth seen (prevents RTT bootstrap) */
+        }
+    }
 
     /* Match BBR: reset LT BW sampling state so lt_last_stamp and lt_last_delivered
      * start from current delivery, not zero (bbr_init:1065). */
@@ -6195,6 +6693,15 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_tso_segs_low",          .data = &kcc_tso_segs_low,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* TSO segments at low pacing rate */
     {.procname = "kcc_tso_segs_default",      .data = &kcc_tso_segs_default,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* TSO segments at normal pacing rate */
     {.procname = "kcc_extra_acked_win_rtts_max", .data = &kcc_extra_acked_win_rtts_max, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* max dual-window RTTs before rotation */
+    /* Global Kalman BDP filter (cross-connection bandwidth estimation) */
+    {.procname = "kcc_kf_enable",              .data = &kcc_kf_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* global Kalman BDP enable */
+    {.procname = "kcc_kf_startup_r_pct",       .data = &kcc_kf_startup_r_pct,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* startup R measurement noise pct */
+    {.procname = "kcc_kf_steady_r_pct",        .data = &kcc_kf_steady_r_pct,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* steady-state R measurement noise pct */
+    {.procname = "kcc_kf_q_shift",             .data = &kcc_kf_q_shift,             .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* process noise shift (Q = 1<<shift) */
+    {.procname = "kcc_kf_chi2_num",            .data = &kcc_kf_chi2_num,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* chi-squared innovation gate num */
+    {.procname = "kcc_kf_chi2_den",            .data = &kcc_kf_chi2_den,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* chi-squared innovation gate den */
+    {.procname = "kcc_kf_discount_num",        .data = &kcc_kf_discount_num,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* fair-share discount numerator */
+    {.procname = "kcc_kf_discount_den",        .data = &kcc_kf_discount_den,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* fair-share discount denominator */
     {} /* sentinel: end of table */
 }; /* end of kcc_ctl_table[] */
 /*

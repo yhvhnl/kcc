@@ -633,6 +633,89 @@ Retransmits are slightly higher — a trade-off consistent with maintaining high
 
 ---
 
+## Global Kalman BDP — Cross-Connection Bandwidth Injection
+
+KCC v1.0 includes an optional cross-connection Global Kalman Filter that estimates the server's steady-state bottleneck bandwidth.  This estimate is used to bootstrap new connections at a conservatively low "dessert speed" — fast enough to skip cold-start ramp-up, slow enough to avoid overshoot.
+
+### Design Principle
+
+The filter is fed with bandwidth samples from the PROBE\_BW **cruise phase** (gain = 1.0×) of all KCC connections.  Cruise-phase samples are the cleanest signal of true available bandwidth — no 1.25× probe overshoot, no 0.75× drain undershoot.  A one-dimensional random-walk Kalman filter (Kalman 1960) tracks the global steady state.
+
+When a new connection is established, the filter's estimate is used to seed:
+
+| Injected value | Purpose |
+|----------------|---------|
+| `minmax` (max\_bw tracker) | Seed the sliding-window bandwidth history so the first few dirty ACK samples don't drag it to zero |
+| `sk_pacing_rate` | Initial pacing rate at neutral gain (BBR\_UNIT); STARTUP's 2.89× gain is applied on the first ACK |
+| `tp->snd_cwnd` | Initial congestion window computed via `kcc_bdp()` at neutral gain |
+
+A defensive floor in `kcc_update_bw` prevents the first few RTTs of low delivery-rate samples from overwriting the injected estimate during STARTUP.  A full-BW guard in `kcc_check_full_bw_reached` prevents the iperf3 control-message exchange from prematurely terminating STARTUP.
+
+### Dessert-Speed Discount Ratio
+
+The effective injection speed is:
+
+```
+coeff = (discount_ratio) / high_gain
+      = (num / den) / 2.89
+```
+
+where `high_gain ≈ 2.89` is the BBR STARTUP pacing multiplier.
+
+| num | coeff  | characteristic |
+|-----|--------|----------------|
+|  35 | 12.1%  | maximum safety, worst-path |
+|  50 | 17.3%  | centre axis (default) |
+|  75 | 25.9%  | mathematical dessert sweet spot |
+|  80 | 27.6%  | mathematical rate ceiling (should not exceed) |
+
+**Note:** `tcp_write_xmit` enforces an initial CWND of `TCP_INIT_CWND` (10 segments, ≈15 KB) for every new connection.  CWND only grows when remote ACKs arrive, so the dessert speed is an upper bound on pacing rate — actual throughput is CWND-limited until sufficient ACKs have been received to open the window.
+
+### Configuration
+
+Enable via `sysctl`:
+
+```bash
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 0–100, recommended 35–75)
+```
+
+**Key sysctl parameters** (`/proc/sys/net/kcc/`):
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `kcc_kf_enable` | 0 | 0–1 | Master enable for global Kalman BDP injection |
+| `kcc_kf_discount_num` | 50 | 0–100 | Dessert-speed numerator (% of fair-share BW) |
+| `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-speed denominator |
+| `kcc_kf_startup_r_pct` | 20 | 1–100 | Measurement noise R% during startup phase |
+| `kcc_kf_steady_r_pct` | 5 | 1–100 | Measurement noise R% during steady-state |
+| `kcc_kf_q_shift` | 20 | 0–30 | Process noise shift (Q = 1 << shift) |
+| `kcc_kf_chi2_num` | 384 | 1–100000 | Chi-squared outlier gate numerator |
+| `kcc_kf_chi2_den` | 100 | 1–100000 | Chi-squared outlier gate denominator |
+
+### First-Second Performance (Trans-Pacific, 212 ms RTT)
+
+```
+Without KF:  2.8 Mbps  →  85 Mbps  →  622 Mbps  →  steady
+With KF:     50 Mbps   →  530 Mbps  →  650 Mbps  →  steady
+```
+
+The first-second speed jumps from ~3 Mbps (cold-start) to ~50 Mbps (dessert-start), and convergence to steady-state is reached within 2–3 seconds.  Retransmissions remain zero throughout.
+
+### How It Works
+
+1. A running KCC connection enters PROBE\_BW cruise phase → round-start boundary → feeds `kcc_kf_update(bw, 5%)` with the current delivery-rate sample.
+2. The Kalman filter updates its estimate `kcc_kf_x` (a running average of steady-state bottleneck bandwidth).
+3. When a **new** connection opens, `kcc_init` calls `kcc_kf_get_init_bw(sk)` which returns `fair × discount / high_gain` — a gain-compensated, fair-share initial bandwidth estimate.
+4. This estimate seeds `sk_pacing_rate`, `tp->snd_cwnd`, and the `minmax` bandwidth tracker — the connection starts at the dessert speed rather than from zero.
+
+### Algorithm Source — *On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel*
+
+The Global Kalman BDP filter is based on the author's article *On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel* (CC BY-SA 4.0):
+https://blog.csdn.net/liulilittle/article/details/161635652
+
+---
+
 *KCC v1.0 — built on BBRv1 (Cardwell et al. 2016, ACM Queue) and the Kalman filter (Kalman 1960).*
 
 ## References

@@ -636,6 +636,87 @@ Testumgebung: China → USA LAX, 212 ms RTT, 8 parallele Flüsse, 26 % Paketverl
 
 Die Wiederholungsübertragungen sind etwas höher — ein Kompromiss, der mit der Aufrechterhaltung einer hohen Linkauslastung bei Paketverlust vereinbar ist. Die Kalman-gestützte min_rtt-Schätzung von KCC liefert eine genauere BDP-Baseline, sodass der Algorithmus auf demselben Pfad einen höheren Durchsatz als BBRv1 aufrechterhalten kann.
 
+## Global Kalman BDP — Verbindungsübergreifende Bandbreiteninjektion
+
+KCC v1.0 enthält einen optionalen verbindungsübergreifenden globalen Kalman-Filter, der die stationäre Engpassbandbreite des Servers schätzt. Diese Schätzung wird verwendet, um neue Verbindungen mit einer konservativ niedrigen „Dessert-Geschwindigkeit" zu starten — schnell genug, um den Kaltstart-Hochlauf zu überspringen, langsam genug, um Überschwingen zu vermeiden.
+
+### Entwurfsprinzip
+
+Der Filter wird mit Bandbreitenproben aus der PROBE\_BW **Cruise-Phase** (Gain = 1,0×) aller KCC-Verbindungen gespeist. Cruise-Phasen-Proben sind das sauberste Signal der tatsächlich verfügbaren Bandbreite — keine 1,25×-Probe-Überschwingung, keine 0,75×-Drain-Unterschwingung. Ein eindimensionaler Random-Walk-Kalman-Filter (Kalman 1960) verfolgt den globalen stationären Zustand.
+
+Wenn eine neue Verbindung aufgebaut wird, wird die Schätzung des Filters verwendet, um Folgendes zu initialisieren:
+
+| Injizierter Wert | Zweck |
+|----------------|---------|
+| `minmax` (max\_bw tracker) | Füllt den gleitenden Fenster-Bandbreitenverlauf vor, sodass die ersten wenigen unsauberen ACK-Proben ihn nicht auf Null ziehen |
+| `sk_pacing_rate` | Anfängliche Pacing-Rate bei neutralem Gain (BBR\_UNIT); der 2,89×-Gain von STARTUP wird beim ersten ACK angewendet |
+| `tp->snd_cwnd` | Initiales Congestion-Window, berechnet über `kcc_bdp()` bei neutralem Gain |
+
+Eine defensive Untergrenze in `kcc_update_bw` verhindert, dass die ersten paar RTTs mit niedrigen Lieferraten-Proben die injizierte Schätzung während STARTUP überschreiben. Ein Full-BW-Guard in `kcc_check_full_bw_reached` verhindert, dass der iperf3-Kontrollnachrichtenaustausch STARTUP vorzeitig beendet.
+
+### Dessert-Geschwindigkeits-Rabattverhältnis
+
+Die effektive Injektionsgeschwindigkeit beträgt:
+
+```
+coeff = (discount_ratio) / high_gain
+      = (num / den) / 2.89
+```
+
+wobei `high_gain ≈ 2.89` der BBR-STARTUP-Pacing-Multiplikator ist.
+
+| num | coeff  | characteristic |
+|-----|--------|----------------|
+|  35 | 12.1%  | Maximale Sicherheit, Worst-Path |
+|  50 | 17.3%  | Mittelachse (Standard) |
+|  75 | 25.9%  | Mathematischer Dessert-Sweet-Spot |
+|  80 | 27.6%  | Mathematische Ratenobergrenze (sollte nicht überschritten werden) |
+
+**Hinweis:** `tcp_write_xmit` erzwingt ein anfängliches CWND von `TCP_INIT_CWND` (10 Segmente, ≈15 KB) für jede neue Verbindung. CWND wächst nur, wenn entfernte ACKs eintreffen, sodass die Dessert-Geschwindigkeit eine Obergrenze für die Pacing-Rate darstellt — der tatsächliche Durchsatz ist CWND-begrenzt, bis genügend ACKs empfangen wurden, um das Fenster zu öffnen.
+
+### Konfiguration
+
+Aktivierung per `sysctl`:
+
+```bash
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
+```
+
+**Wichtige sysctl-Parameter** (`/proc/sys/net/kcc/`):
+
+| Parameter | Standard | Bereich | Beschreibung |
+|-----------|---------|-------|-------------|
+| `kcc_kf_enable` | 0 | 0–1 | Master-Aktivierung für die globale Kalman-BDP-Injektion |
+| `kcc_kf_discount_num` | 50 | 0–100 | Dessert-Geschwindigkeitszähler (% der Fair-Share-BW) |
+| `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-Geschwindigkeitsnenner |
+| `kcc_kf_startup_r_pct` | 20 | 1–100 | Messrauschen R% während der Startup-Phase |
+| `kcc_kf_steady_r_pct` | 5 | 1–100 | Messrauschen R% während des stationären Zustands |
+| `kcc_kf_q_shift` | 20 | 0–30 | Prozessrauschen-Shift (Q = 1 << shift) |
+| `kcc_kf_chi2_num` | 384 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Zähler |
+| `kcc_kf_chi2_den` | 100 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Nenner |
+
+### Leistung in der ersten Sekunde (Trans-Pazifik, 212 ms RTT)
+
+```
+Without KF:  2.8 Mbps  →  85 Mbps  →  622 Mbps  →  steady
+With KF:     50 Mbps   →  530 Mbps  →  650 Mbps  →  steady
+```
+
+Die Geschwindigkeit in der ersten Sekunde springt von ~3 Mbps (Kaltstart) auf ~50 Mbps (Dessert-Start), und die Konvergenz zum stationären Zustand wird innerhalb von 2–3 Sekunden erreicht. Wiederholungsübertragungen bleiben durchgehend bei null.
+
+### Funktionsweise
+
+1. Eine laufende KCC-Verbindung tritt in die PROBE\_BW Cruise-Phase ein → Round-Start-Grenze → füttert `kcc_kf_update(bw, 5%)` mit der aktuellen Lieferraten-Probe.
+2. Der Kalman-Filter aktualisiert seine Schätzung `kcc_kf_x` (einen gleitenden Durchschnitt der stationären Engpassbandbreite).
+3. Wenn eine **neue** Verbindung geöffnet wird, ruft `kcc_init` die Funktion `kcc_kf_get_init_bw(sk)` auf, die `fair × discount / high_gain` zurückgibt — eine gain-kompensierte, fair-share-initiale Bandbreitenschätzung.
+4. Diese Schätzung initialisiert `sk_pacing_rate`, `tp->snd_cwnd` und den `minmax`-Bandbreiten-Tracker — die Verbindung startet mit der Dessert-Geschwindigkeit anstatt bei null.
+
+### Algorithmus-Quelle
+
+Der Global Kalman BDP-Filter basiert auf dem Artikel des Autors *Zur Kalman-Schätzung und technischen Implementierung globaler stationärer Bandbreite im Linux-Kernel* (CC BY-SA 4.0):
+https://blog.csdn.net/liulilittle/article/details/161635652
+
 ---
 
 *KCC v1.0 — basiert auf BBRv1 (Cardwell et al. 2016, ACM Queue) und dem Kalman-Filter (Kalman 1960).*
