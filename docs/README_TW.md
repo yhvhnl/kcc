@@ -91,11 +91,11 @@ PROBE_RTT 間隔到期時觸發（`min_rtt_stamp` 在計算間隔內未更新）
 
 ### PROBE_RTT → PROBE_BW
 
-在途資料降至 `kcc_cwnd_min_target` 或輪邊界後，駐留至少 `kcc_probe_rtt_mode_ms_val`（預設 200 ms）且至少一輪完整輪次後退出。cwnd 恢復至 `prior_cwnd`，pacing 暫用 `kcc_high_gain_val` 覆寫以快速填充管道。
+在途資料降至 `kcc_cwnd_min_target` 或輪邊界後，駐留至少 `kcc_probe_rtt_mode_ms_val`（預設 200 ms）且至少一輪完整輪次後退出。cwnd 恢復至 `prior_cwnd`，進入標準 PROBE_BW 增益循環。
 
 ### 恢復與遺失
 
-- TCP_CA_Loss：`full_bw` 和 `full_bw_cnt` 重置，`round_start` 設 1，`packet_conservation` 清 0。若 LT BW 未激活，注入合成遺失事件觸發 LT 取樣。
+- TCP_CA_Loss：`full_bw` 和 `full_bw_cnt` 重置，`round_start` 設 1，`packet_conservation` 清 0。
 - 恢復入（TCP_CA_Recovery）：啟用 `packet_conservation`，cwnd = 在途 + 已 ACK。
 - 恢復出：恢復至 `prior_cwnd`，`packet_conservation` 清 0。
 - `kcc_undo_cwnd()`：重置 `full_bw` 和 `full_bw_cnt`（保留 `full_bw_reached`），清除 LT BW 狀態。
@@ -258,9 +258,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 **雙閾值壅塞門控**：在設置 `lt_use_bw = 1` 之前，評估持久 EWMA 佇列檢查（`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`）和基於 SRTT 的瞬時佇列檢查（`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`，預設 5000 µs）。檢測到壅塞時，LT BW 取樣被中止。SRTT 檢查無需 `ext` 分配即可工作。
 
-LT BW 探測增強（`kcc_lt_bw_probe_pct`，預設 10%）：PROBE_BW 所有相位中 pacing_gain 放大 `1 + probe_pct/100`。斜坡部分：`+1% per 8 RTTs` 持續增加，上限 `2 × probe_pct`。
 
-LT BW 自動恢復（`kcc_lt_restore_ratio_num/den`，預設 5/4 = 1.25x）：`max_bw > lt_bw × ratio` 持續 `kcc_lt_restore_consec_acks`（預設 3）個連續 ACK 時自動退出 LT BW。
 
 ### ACK 聚合置信度補償（BBRplus 啟發）
 
@@ -433,14 +431,7 @@ PROBE_RTT 時：cwnd = min(cwnd, cwnd_min_target)   // 最小在途
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | 絕對容差 |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | LT BW 最大有效 RTTs |
 | `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | LT BW EMA 權重 |
-| `kcc_lt_bw_probe_pct` | 10 | 0-100 | % | LT BW 探測增強 |
 
-### LT 自動恢復
-
-| 參數 | 預設 | 範圍 | 描述 |
-|-----------|---------|-------|-------------|
-| `kcc_lt_restore_ratio_num` / `kcc_lt_restore_ratio_den` | 5 / 4 | 0-100k / 1-100k | 恢復觸發比例 |
-| `kcc_lt_restore_consec_acks` | 3 | 1-31 | 恢復觸發連續 ACK 數 |
 
 ### ACK 聚合置信度
 

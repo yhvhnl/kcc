@@ -89,18 +89,18 @@ PROBE_RTT 필터 간격이 만료되면 트리거됩니다——타임스탬프 
 
 ### PROBE_RTT → PROBE_BW
 
-in-flight가 `kcc_cwnd_min_target`까지 떨어지거나 라운드 경계가 관측된 후, 최소 `kcc_probe_rtt_mode_ms_val`(기본값 200 ms) 이상 그리고 최소 1회 완전 라운드가 관측된 후 종료됩니다. cwnd는 최소 `prior_cwnd`까지 복원되고, 페이싱은 `kcc_high_gain_val`로 일시적으로 오버라이드되어 파이프를 빠르게 재충전합니다.
+in-flight가 `kcc_cwnd_min_target`까지 떨어지거나 라운드 경계가 관측된 후, 최소 `kcc_probe_rtt_mode_ms_val`(기본값 200 ms) 이상 그리고 최소 1회 완전 라운드가 관측된 후 종료됩니다. cwnd는 `prior_cwnd`로 복원되고, 표준 PROBE_BW 게인 사이클로 진입합니다.
 
 ### 복구 및 손실
 
-- TCP_CA_Loss 시: `full_bw`와 `full_bw_cnt`가 리셋되고, `round_start`가 1로 설정되며, `packet_conservation`이 0으로 클리어됩니다. LT BW가 활성화되지 않은 경우, 합성 손실 이벤트를 주입하여 LT 샘플링을 트리거합니다.
+- TCP_CA_Loss 시: `full_bw`와 `full_bw_cnt`가 리셋되고, `round_start`가 1로 설정되며, `packet_conservation`이 0으로 클리어됩니다.
 - 복구 진입(TCP_CA_Recovery): `packet_conservation` 활성화, cwnd = in-flight + acked.
 - 복구 종료: `prior_cwnd`로 복원, `packet_conservation` 클리어.
 - `kcc_undo_cwnd()`: `full_bw`와 `full_bw_cnt`를 리셋하고(`full_bw_reached` 유지), LT BW 상태를 클리어합니다.
 
 ### 라운드 감지 (BBR 정렬)
 
-라운드 경계는 BBR(Cardwell et al. 2016)에 따라 감지됩니다: `prior_delivered`가 부호 없는 `!before()` 비교를 통해 `next_rtt_delivered` 이상이 되는 경우. `next_rtt_delivered`는 `0`으로 초기화됩니다 — 표준 BBR과 동일 — 따라서 첫 번째 ACK는 핸드셰이크 세그먼트 전달과 관계없이 즉시 라운드 1을 시작합니다. 레이트 샘플 검증은 `interval_us <= 0`(`== 0`이 아님)을 사용하여 BBR의 정확한 가드와 일치시키고 음수 간격을 포착합니다.
+`next_rtt_delivered`는 `0`으로 초기화되며(표준 BBR과 동일; Cardwell et al. 2016), 첫 번째 ACK가 즉시 라운드 1 감지를 시작하므로 인위적인 오프셋이 필요하지 않습니다. `prior_delivered >= next_rtt_delivered`일 때 라운드 경계가 감지되며, `interval_us <= 0` 가드(BBR의 `delivered < 0 || interval_us <= 0`와 일치)를 사용하여 0 값 및 음수 간격을 포착하고 측정 파이프라인 오염을 방지합니다.
 
 - `next_rtt_delivered`는 `0`으로 초기화(BBR 준거): 첫 번째 ACK에서 첫 번째 라운드 시작.
 - `interval_us <= 0` 검증: BBR에 정확히 일치, 음수 간격 거부.
@@ -256,9 +256,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 **이중 임계값 혼잡 게이트**: `lt_use_bw = 1`을 설정하기 전에, 지속적인 EWMA 큐 검사(`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`)와 SRTT 기반 순시 큐 검사(`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, 기본값 5000 µs)가 모두 평가됩니다. 혼잡이 감지되면 LT BW 샘플링이 중단됩니다. SRTT 검사는 `ext` 할당 없이 작동하여 할당 실패에 대한 안전망을 제공합니다.
 
-LT BW 프로브 부스트(`kcc_lt_bw_probe_pct`, 기본값 10%): 모든 PROBE_BW 페이즈에서 `pacing_gain`을 `1 + probe_pct/100`배 증폭. 램프 구성 요소: `8 RTT마다 +1%` 증가, 상한은 `2 × probe_pct`.
 
-LT BW 자동 복구(`kcc_lt_restore_ratio_num/den`, 기본값 5/4 = 1.25x): `max_bw > lt_bw × ratio`가 `kcc_lt_restore_consec_acks`(기본값 3)회 연속 ACK 동안 지속되면 LT BW가 자동으로 종료되고 정상 PROBE_BW 프로빙이 재개됩니다.
 
 ### ACK 집계 신뢰도 기반 보상(BBRplus에서 유래)
 
@@ -436,14 +434,8 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // 최소 in-flight
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | 상대 허용 오차 |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | 절대 허용 오차 |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | LT BW 최대 활성 RTTs |
-| `kcc_lt_bw_probe_pct` | 10 | 0-100 | % | LT BW 프로브 부스트 |
+| `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | LT BW EMA 가중치 |
 
-### LT 자동 복구
-
-| 파라미터 | 기본값 | 범위 | 설명 |
-|-----------|---------|-------|-------------|
-| `kcc_lt_restore_ratio_num` / `kcc_lt_restore_ratio_den` | 5 / 4 | 0-100k / 1-100k | 복구 트리거 비율 |
-| `kcc_lt_restore_consec_acks` | 3 | 1-31 | 트리거 연속 ACK 수 |
 
 ### ACK 집계 신뢰도
 
@@ -490,6 +482,8 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // 최소 in-flight
 | `kcc_min_tso_rate` | 1,200,000 | 1-1B | bytes/s | TSO 저속 임계값 |
 | `kcc_min_tso_rate_div` | 8 | 1-256 | TSO 속도 제수(적응형 기준) |
 | `kcc_tso_max_segs` | 127 | 1-65535 | segs | 최대 TSO 세그먼트 수 |
+| `kcc_tso_segs_low` | 1 | 1-65535 | segs | 저속 TSO 세그먼트 수 |
+| `kcc_tso_segs_default` | 2 | 1-65535 | segs | 정상 속도 TSO 세그먼트 수 |
 | `kcc_tso_headroom_mult` | 3 | 0-1000 | TSO 헤드룸 승수 |
 | `kcc_sndbuf_expand_factor` | 3 | 2-100 | 송신 버퍼 확장 인자 |
 | `kcc_ack_epoch_max` | 0xFFFFF | 64K-2G | bytes | ACK 에포크 상한 |

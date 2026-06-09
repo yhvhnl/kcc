@@ -95,7 +95,7 @@ Après que le trafic en vol chute à `kcc_cwnd_min_target` ou qu'une limite de r
 
 ### Récupération et Perte
 
-- Sur TCP_CA_Loss : `full_bw` et `full_bw_cnt` sont réinitialisés, `round_start` mis à 1, `packet_conservation` effacé à 0. Si LT BW n'est pas actif, injecte un événement de perte synthétique pour déclencher l'échantillonnage LT.
+- Sur TCP_CA_Loss : `full_bw` et `full_bw_cnt` sont réinitialisés, `round_start` mis à 1, `packet_conservation` effacé à 0.
 - Entrée de récupération (TCP_CA_Recovery) : `packet_conservation` activé, cwnd = en vol + acquitté.
 - Sortie de récupération : restauré à `prior_cwnd`, `packet_conservation` effacé.
 - `kcc_undo_cwnd()` : réinitialise `full_bw` et `full_bw_cnt` (en préservant `full_bw_reached`), efface l'état LT BW.
@@ -257,9 +257,8 @@ L'activation diffère de BBR : KCC stocke `lt_bw` sur le premier intervalle vali
 
 **Porte de congestion à double seuil** : Avant de définir `lt_use_bw = 1`, une vérification de file EWMA persistante (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) ET une vérification de file instantanée basée sur SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, par défaut 5000 µs) sont évaluées. Lorsqu'une congestion est détectée, l'échantillonnage LT BW est abandonné. La vérification SRTT fonctionne sans allocation `ext`, fournissant un filet de sécurité contre les échecs d'allocation.
 
-Boost de sonde LT BW (`kcc_lt_bw_probe_pct`, par défaut 10%) : amplifie `pacing_gain` par `1 + probe_pct/100` sur toutes les phases PROBE_BW. Composante de rampe : augmentation de `+1% par 8 RTTs`, plafonnée à `2 × probe_pct`.
 
-Auto-récupération LT BW (`kcc_lt_restore_ratio_num/den`, par défaut 5/4 = 1,25x) : lorsque `max_bw > lt_bw × ratio` pendant `kcc_lt_restore_consec_acks` (par défaut 3) ACKs consécutifs, LT BW se désactive automatiquement et le sondage normal PROBE_BW reprend.
+
 
 ### Compensation Basée sur la Confiance d'Agrégation ACK (inspiré de BBRplus)
 
@@ -437,14 +436,8 @@ Les paramètres sont exposés sous `/proc/sys/net/kcc/`. Les écritures déclenc
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Tolérance relative |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Tolérance absolue |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | RTTs actifs max de LT BW |
-| `kcc_lt_bw_probe_pct` | 10 | 0-100 | % | Boost de sonde LT BW |
+| `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | Poids EMA LT BW |
 
-### Auto-Récupération LT
-
-| Paramètre | Par défaut | Plage | Description |
-|-----------|------------|-------|-------------|
-| `kcc_lt_restore_ratio_num` / `kcc_lt_restore_ratio_den` | 5 / 4 | 0-100k / 1-100k | Ratio de déclenchement de récupération |
-| `kcc_lt_restore_consec_acks` | 3 | 1-31 | Nombre d'ACKs consécutifs de déclenchement |
 
 ### Confiance d'Agrégation ACK
 
@@ -518,8 +511,6 @@ kcc_main()
     │
     ├──► Pipeline de confiance d'agrégation ACK (quand kcc_agg_enable)
     │      mesurer → évaluer → état → chien de garde
-    │      ├── Couche de signal : mise à l'échelle R de Kalman (toujours active)
-    │      └── Couche de contrôle : compensation cwnd (CONFIRMÉ+)
     │
     ├──► kcc_update_model()
     │      ├── kcc_update_bw()              BW max à fenêtre glissante

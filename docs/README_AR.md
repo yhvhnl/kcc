@@ -91,18 +91,18 @@
 
 ### PROBE_RTT → PROBE_BW
 
-بعد انخفاض الحزم قيد الطيران إلى `kcc_cwnd_min_target` أو ملاحظة حد دورة، يستمر لمدة `kcc_probe_rtt_mode_ms_val` على الأقل (افتراضي 200 ملي ثانية) ودورة كاملة واحدة على الأقل، ثم يخرج. يتم استعادة cwnd إلى `prior_cwnd` على الأقل، ويتم تجاوز السرعة مؤقتاً بـ `kcc_high_gain_val` لإعادة ملء الأنبوب بسرعة.
+بعد انخفاض الحزم قيد الطيران إلى `kcc_cwnd_min_target` أو ملاحظة حد دورة، يستمر لمدة `kcc_probe_rtt_mode_ms_val` على الأقل (افتراضي 200 ملي ثانية) ودورة كاملة واحدة على الأقل، ثم يخرج. يتم استعادة cwnd إلى `prior_cwnd`، والدخول في دورة كسب PROBE_BW القياسية.
 
 ### الاسترداد والخسارة
 
-- عند TCP_CA_Loss: إعادة تعيين `full_bw` و `full_bw_cnt`، تعيين `round_start` إلى 1، مسح `packet_conservation` إلى 0. إذا كان LT BW غير نشط، يحقن حدث خسارة اصطناعي لتفعيل أخذ عينات LT.
+- عند TCP_CA_Loss: إعادة تعيين `full_bw` و `full_bw_cnt`، تعيين `round_start` إلى 1، مسح `packet_conservation` إلى 0.
 - دخول الاسترداد (TCP_CA_Recovery): تفعيل `packet_conservation`، cwnd = inflight + acked.
 - خروج الاسترداد: استعادة إلى `prior_cwnd`، مسح `packet_conservation`.
 - `kcc_undo_cwnd()`: يعيد تعيين `full_bw` و `full_bw_cnt` (مع الحفاظ على `full_bw_reached`)، ويمسح حالة LT BW.
 
 ### اكتشاف الدورة (BBR)
 
-يتم اكتشاف حدود الدورات وفقًا لـ BBR (Cardwell et al. 2016): عندما يصل `prior_delivered` أو يتجاوز `next_rtt_delivered` عبر المقارنة غير الموقعة `!before()`. يتم تهيئة `next_rtt_delivered` إلى `0` — مطابقًا لـ BBR الأصلي — لذلك يبدأ أول ACK فورًا الدورة 1 بغض النظر عن تسليم شرائح المصافحة. يستخدم التحقق من صحة عينة المعدل `interval_us <= 0` (وليس `== 0`) لمطابقة حماية BBR الدقيقة، والتقاط الفترات السالبة.
+تتم تهيئة `next_rtt_delivered` إلى `0` (مطابق لـ BBR القياسي؛ Cardwell et al. 2016)، لذا يبدأ أول ACK فوراً في اكتشاف الجولة 1 دون إزاحة اصطناعية. يتم اكتشاف حدود الجولة عند `prior_delivered >= next_rtt_delivered`، باستخدام حارس `interval_us <= 0` (مطابق لحارس BBR `delivered < 0 || interval_us <= 0`) — مما يلتقط الفترات الصفرية والسالبة ويمنعها من تلويث خط أنابيب القياس.
 
 - `next_rtt_delivered` مهيأ إلى `0` (توافق BBR): تبدأ الدورة الأولى عند أول ACK.
 - التحقق `interval_us <= 0`: يطابق BBR تمامًا، يرفض الفترات السالبة.
@@ -257,9 +257,6 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 **بوابة الازدحام ثنائية العتبة**: قبل تعيين `lt_use_bw = 1`، يتم تقييم كل من فحص طابور EWMA المستمر (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) وفحص الطابور الفوري المعتمد على SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`، افتراضي 5000 ميكروثانية). عند اكتشاف ازدحام، يتم إحباط أخذ عينات LT BW. يعمل فحص SRTT دون تخصيص `ext`، مما يوفر شبكة أمان ضد فشل التخصيص.
 
-تعزيز استكشاف LT BW (`kcc_lt_bw_probe_pct`، افتراضي 10%): يضخّم pacing_gain بـ `1 + probe_pct/100` عبر جميع مراحل PROBE_BW. المكون التراكمي: `+1% لكل 8 RTT` زيادة، محدود بـ `2 × probe_pct`.
-
-الاسترداد التلقائي لـ LT BW (`kcc_lt_restore_ratio_num/den`، افتراضي 5/4 = 1.25x): عندما `max_bw > lt_bw × ratio` لـ `kcc_lt_restore_consec_acks` (افتراضي 3) ACK متتالية، يخرج LT BW تلقائياً ويستأنف استكشاف PROBE_BW العادي.
 
 ### تعويض تجميع ACK المعتمد على الثقة (مستوحى من BBRplus)
 
@@ -437,14 +434,8 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | التسامح النسبي |
 | `kcc_lt_bw_diff` | 500 | 0-100k | بايت/ثانية | التسامح المطلق |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTT | أقصى RTT نشطة لـ LT BW |
-| `kcc_lt_bw_probe_pct` | 10 | 0-100 | % | تعزيز استكشاف LT BW |
+| `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | وزن EMA لـ LT BW |
 
-### الاسترداد التلقائي لـ LT
-
-| المعامل | الافتراضي | النطاق | الوصف |
-|-----------|---------|-------|-------------|
-| `kcc_lt_restore_ratio_num` / `kcc_lt_restore_ratio_den` | 5 / 4 | 0-100k / 1-100k | نسبة تفعيل الاسترداد |
-| `kcc_lt_restore_consec_acks` | 3 | 1-31 | عدد ACK المتتالية للتفعيل |
 
 ### ثقة تجميع ACK
 
@@ -491,6 +482,8 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_min_tso_rate` | 1,200,000 | 1-1B | بايت/ثانية | عتبة المعدل المنخفض لـ TSO |
 | `kcc_min_tso_rate_div` | 8 | 1-256 | مقسم معدل TSO (قاعدة تكيفية) |
 | `kcc_tso_max_segs` | 127 | 1-65535 | شريحة | أقصى شرائح TSO |
+| `kcc_tso_segs_low` | 1 | 1-65535 | شريحة | شرائح TSO عند المعدل المنخفض |
+| `kcc_tso_segs_default` | 2 | 1-65535 | شريحة | شرائح TSO عند المعدل الطبيعي |
 | `kcc_tso_headroom_mult` | 3 | 0-1000 | مضاعف مساحة TSO |
 | `kcc_sndbuf_expand_factor` | 3 | 2-100 | عامل توسيع مخزن الإرسال |
 | `kcc_ack_epoch_max` | 0xFFFFF | 64K-2G | بايت | سقف حقبة ACK |

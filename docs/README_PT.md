@@ -91,18 +91,18 @@ Acionado quando o intervalo do filtro PROBE_RTT expira — o timestamp `min_rtt_
 
 ### PROBE_RTT → PROBE_BW
 
-Após o tráfego em voo cair para `kcc_cwnd_min_target` ou um limite de rodada ser observado, persiste por pelo menos `kcc_probe_rtt_mode_ms_val` (padrão 200 ms) e pelo menos uma rodada completa observada, então sai. cwnd é restaurado para pelo menos `prior_cwnd`, pacing é temporariamente substituído por `kcc_high_gain_val` para reabastecimento rápido do pipe.
+Após o tráfego em voo cair para `kcc_cwnd_min_target` ou um limite de rodada ser observado, persiste por pelo menos `kcc_probe_rtt_mode_ms_val` (padrão 200 ms) e pelo menos uma rodada completa observada, então sai. cwnd é restaurado para `prior_cwnd`, entrando no ciclo de ganho PROBE_BW padrão.
 
 ### Recuperação e Perda
 
-- Em TCP_CA_Loss: `full_bw` e `full_bw_cnt` são redefinidos, `round_start` é definido como 1, `packet_conservation` é limpo para 0. Se LT BW não estiver ativo, injeta um evento de perda sintético para acionar a amostragem LT.
+- Em TCP_CA_Loss: `full_bw` e `full_bw_cnt` são redefinidos, `round_start` é definido como 1, `packet_conservation` é limpo para 0.
 - Entrada de recuperação (TCP_CA_Recovery): `packet_conservation` habilitado, cwnd = inflight + acked.
 - Saída de recuperação: restaurado para `prior_cwnd`, `packet_conservation` limpo.
 - `kcc_undo_cwnd()`: redefine `full_bw` e `full_bw_cnt` (preservando `full_bw_reached`), limpa o estado LT BW.
 
 ### Detecção de rodada (Alinhamento BBR)
 
-Os limites de rodada são detectados conforme BBR, Cardwell et al. 2016: quando `prior_delivered` atinge ou excede `next_rtt_delivered` via comparação unsigned `!before()`. `next_rtt_delivered` é inicializado como `0` — igual ao BBR padrão — então o primeiro ACK inicia imediatamente a rodada 1, independentemente da entrega dos segmentos de handshake. A validação da amostra de taxa usa `interval_us <= 0` (não `== 0`) para corresponder à guarda exata do BBR, capturando intervalos negativos.
+`next_rtt_delivered` é inicializado como `0` (igual ao BBR padrão; Cardwell et al. 2016), então o primeiro ACK inicia imediatamente a detecção da rodada 1 sem deslocamento artificial. Os limites de rodada são detectados quando `prior_delivered >= next_rtt_delivered`, usando a guarda `interval_us <= 0` (equivalente a `delivered < 0 || interval_us <= 0` do BBR) — capturando intervalos zero e negativos e impedindo que contaminem o pipeline de medição.
 
 - `next_rtt_delivered` inicializado como `0` (paridade BBR): a primeira rodada começa no primeiro ACK.
 - Validação `interval_us <= 0`: corresponde exatamente ao BBR, rejeita intervalos negativos.
@@ -257,9 +257,7 @@ A ativação difere do BBR: o KCC armazena `lt_bw` no primeiro intervalo válido
 
 **Portão de congestionamento de limiar duplo**: Antes de definir `lt_use_bw = 1`, tanto uma verificação de fila EWMA persistente (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) QUANTO uma verificação de fila instantânea baseada em SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, padrão 5000 µs) são avaliadas. Quando a congestão é detectada, a amostragem LT BW é abortada. A verificação SRTT funciona sem alocação `ext`, fornecendo uma rede de segurança contra falha de alocação.
 
-Impulso de sonda LT BW (`kcc_lt_bw_probe_pct`, padrão 10%): amplifica pacing_gain em `1 + probe_pct/100` em todas as fases PROBE_BW. Componente de rampa: aumento de `+1% a cada 8 RTTs`, limitado a `2 × probe_pct`.
 
-Autorecuperação LT BW (`kcc_lt_restore_ratio_num/den`, padrão 5/4 = 1.25x): quando `max_bw > lt_bw × ratio` por `kcc_lt_restore_consec_acks` (padrão 3) ACKs consecutivos, o LT BW sai automaticamente e a sondagem normal PROBE_BW é retomada.
 
 ### Compensação de Agregação ACK Baseada em Confiança (inspirado no BBRplus)
 
@@ -437,14 +435,8 @@ Parâmetros são expostos em `/proc/sys/net/kcc/`. Escritas acionam `kcc_init_mo
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Tolerância relativa |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Tolerância absoluta |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | RTTs ativos máximos LT BW |
-| `kcc_lt_bw_probe_pct` | 10 | 0-100 | % | Impulso de sonda LT BW |
+| `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | Peso EMA LT BW |
 
-### Autorecuperação LT
-
-| Parâmetro | Padrão | Faixa | Descrição |
-|-----------|---------|-------|-------------|
-| `kcc_lt_restore_ratio_num` / `kcc_lt_restore_ratio_den` | 5 / 4 | 0-100k / 1-100k | Razão de gatilho de recuperação |
-| `kcc_lt_restore_consec_acks` | 3 | 1-31 | Contagem de ACKs consecutivos para gatilho |
 
 ### Confiança de Agregação ACK
 
@@ -491,6 +483,8 @@ Parâmetros são expostos em `/proc/sys/net/kcc/`. Escritas acionam `kcc_init_mo
 | `kcc_min_tso_rate` | 1,200,000 | 1-1B | bytes/s | Limiar de taxa baixa TSO |
 | `kcc_min_tso_rate_div` | 8 | 1-256 | Divisor de taxa TSO (base adaptativa) |
 | `kcc_tso_max_segs` | 127 | 1-65535 | segs | Máximo de segmentos TSO |
+| `kcc_tso_segs_low` | 1 | 1-65535 | segs | Segmentos TSO em taxa baixa |
+| `kcc_tso_segs_default` | 2 | 1-65535 | segs | Segmentos TSO em taxa normal |
 | `kcc_tso_headroom_mult` | 3 | 0-1000 | Multiplicador de margem TSO |
 | `kcc_sndbuf_expand_factor` | 3 | 2-100 | Fator de expansão do buffer de envio |
 | `kcc_ack_epoch_max` | 0xFFFFF | 64K-2G | bytes | Limite de época ACK |
