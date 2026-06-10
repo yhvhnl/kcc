@@ -307,7 +307,6 @@ rate = rate × margin_div / 100                    // 페이싱 마진(기본값
 
 ```
 target = BDP(bw, gain, ext)                       // 기본 BDP
-// in-flight 경계(비-STARTUP: lo~hi 클램프; STARTUP: lo 플로어만)
 target = quantization_budget(target)              // TSO 헤드룸 + 짝수 라운드 + phase-0 보너스
 target += ack_agg_bonus + agg_compensation        // ACK 집계 보상
 
@@ -341,8 +340,6 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // 최소 in-flight
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK 집계 보너스 승수 |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP 게인(≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN 게인(≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | in-flight 하한(1.0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | in-flight 상한(2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 패턴(256 슬롯) | 0/1 | — | 슬롯별 페이싱 게인 |
 | `kcc_cycle_decay_mask[8]` | 0(모두 0) | 0 | 0x7FFFFFFF | 256비트 감쇠 비트맵 |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | 프로브-업 제한 종료（0=꺼짐） |
@@ -530,7 +527,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              즉시, BBR 규칙
     │
-    └──► kcc_set_cwnd()                    BDP + 경계 + 집계 보상
+    └──► kcc_set_cwnd()                    BDP + 집계 보상
 ```
 
 ## 칼만 필터 내부 흐름
@@ -674,7 +671,7 @@ coeff = (discount_ratio) / high_gain
 `sysctl`을 통해 활성화:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # 마스터 활성화 (기본값 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # 마스터 활성화 (기본값 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # 디저트 속도 분자 (기본값 50, 범위 35–75)
 ```
 
@@ -682,14 +679,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # 디저트 속도 분자 (기본값 
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | 글로벌 칼만 BDP 주입 마스터 활성화 |
+| `kcc_kf_enable` | 1 | 0–1 | 글로벌 칼만 BDP 주입 마스터 활성화 |
 | `kcc_kf_discount_num` | 50 | 0–100 | 디저트 속도 분자 (공정 점유 대역폭의 %) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | 디저트 속도 분모 |
+| `kcc_kf_steady_mode` | 0 | 0/1 | — | 정상 모드: 활성화 시 KF의 일시적 하락을 무시하고 단조 증가 피크(kf_x_steady)를 초기 대역폭으로 사용 |
 | `kcc_kf_startup_r_pct` | 20 | 1–100 | 시작 단계 중 측정 노이즈 R% |
 | `kcc_kf_steady_r_pct` | 5 | 1–100 | 정상 상태 중 측정 노이즈 R% |
 | `kcc_kf_q_shift` | 20 | 0–30 | 프로세스 노이즈 시프트 (Q = 1 << shift) |
 | `kcc_kf_chi2_num` | 384 | 1–100000 | 카이제곱 이상치 게이트 분자 |
 | `kcc_kf_chi2_den` | 100 | 1–100000 | 카이제곱 이상치 게이트 분모 |
+
+kcc_kf_steady_mode 가 활성화(1)되면 새 연결의 초기 대역폭은 KF 추정의 단조 증가 피크(kf_x_steady)를 사용하며, 이전 연결 종료로 인해 하락했을 수 있는 실시간 추정은 무시된다. 이는 안정적인 경로에서 콜드 스타트 기아를 방지한다. 모드 비활성화 시 피크가 0으로 재설정되어 재활성화 시 깨끗한 상태에서 시작한다.
 
 ### 첫 1초 성능 (태평양 횡단, 212 ms RTT)
 

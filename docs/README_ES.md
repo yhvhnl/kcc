@@ -309,7 +309,6 @@ Los cambios de tasa se aplican inmediatamente (sin suavizado), coincidiendo con 
 
 ```
 target = BDP(bw, gain, ext)                       // BDP base
-// límites de tráfico en vuelo (no-STARTUP: pinza lo~hi; STARTUP: solo piso lo)
 target = quantization_budget(target)              // espacio libre TSO + ronda par + bonificación fase-0
 target += ack_agg_bonus + agg_compensation        // compensación de agregación ACK
 
@@ -343,8 +342,6 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | Multiplicador de bonificación de agregación ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | Ganancia STARTUP (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | Ganancia DRAIN (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Límite inferior de tráfico en vuelo (1.0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Límite superior de tráfico en vuelo (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | Patrón BBRv1 (256 ranuras) | 0/1 | — | Ganancia de pacing por ranura |
 | `kcc_cycle_decay_mask[8]` | 0 (todos cero) | 0 | 0x7FFFFFFF | Mapa de bits de decaimiento de 256 bits |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Salida limitada de sondeo ascendente (0=apagado) |
@@ -528,7 +525,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              inmediato, regla BBR
     │
-    └──► kcc_set_cwnd()                    BDP + límites + compensación agg
+    └──► kcc_set_cwnd()                    BDP + compensación agg
 ```
 
 ## Flujo Interno del Filtro de Kalman
@@ -671,7 +668,7 @@ donde `high_gain ≈ 2.89` es el multiplicador de pacing de STARTUP de BBR.
 Habilitar mediante `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # habilitación maestra (predeterminado 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # habilitación maestra (predeterminado 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador de velocidad de postre (predet. 50, rango 35–75)
 ```
 
@@ -679,14 +676,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador de velocidad de postre (p
 
 | Parámetro | Predet. | Rango | Descripción |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Habilitación maestra para inyección global Kalman BDP |
+| \`kcc_kf_enable\` | 1 | 0–1 | Habilitación maestra para inyección global Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numerador de velocidad de postre (% del BW de participación justa) |
-| `kcc_kf_discount_den` | 100 | 1–100000 | Denominador de velocidad de postre |
-| `kcc_kf_startup_r_pct` | 20 | 1–100 | R% de ruido de medición durante la fase de arranque |
-| `kcc_kf_steady_r_pct` | 5 | 1–100 | R% de ruido de medición durante estado estacionario |
-| `kcc_kf_q_shift` | 20 | 0–30 | Desplazamiento de ruido de proceso (Q = 1 << shift) |
-| `kcc_kf_chi2_num` | 384 | 1–100000 | Numerador de compuerta de valores atípicos chi-cuadrado |
-| `kcc_kf_chi2_den` | 100 | 1–100000 | Denominador de compuerta de valores atípicos chi-cuadrado |
+| \`kcc_kf_discount_den\` | 100 | 1–100000 | Denominador de velocidad de postre |
+| \`kcc_kf_steady_mode\` | 0 | 0/1 | — | Modo estable: al activarse, usa el pico monótono (kf_x_steady) para init_bw, ignorando caídas transitorias del KF |
+| \`kcc_kf_startup_r_pct\` | 20 | 1–100 | R% de ruido de medición durante la fase de arranque |
+| \`kcc_kf_steady_r_pct\` | 5 | 1–100 | R% de ruido de medición durante estado estacionario |
+| \`kcc_kf_q_shift\` | 20 | 0–30 | Desplazamiento de ruido de proceso (Q = 1 << shift) |
+| \`kcc_kf_chi2_num\` | 384 | 1–100000 | Numerador de compuerta de valores atípicos chi-cuadrado |
+| \`kcc_kf_chi2_den\` | 100 | 1–100000 | Denominador de compuerta de valores atípicos chi-cuadrado |
+
+Cuando kcc_kf_steady_mode está habilitado (1), el ancho de banda inicial para nuevas conexiones usa el pico monótono de la estimación KF (kf_x_steady) en lugar de la estimación en vivo, que puede haber disminuido desde la última conexión de alto rendimiento. Esto evita la inanición de arranque en frío en rutas estables. El pico se reinicia a cero al deshabilitar el modo, permitiendo un inicio limpio al reactivarlo.
 
 ### Rendimiento en el Primer Segundo (Transpacífico, 212 ms RTT)
 

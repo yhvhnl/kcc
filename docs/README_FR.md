@@ -309,7 +309,6 @@ Les changements de taux sont appliqués immédiatement (sans lissage), comme dan
 
 ```
 target = BDP(bw, gain, ext)                       // BDP de base
-// bornes du trafic en vol (non-STARTUP : clamp lo~hi ; STARTUP : plancher lo seulement)
 target = quantization_budget(target)              // marge TSO + round pair + bonus phase-0
 target += ack_agg_bonus + agg_compensation        // compensation d'agrégation ACK
 
@@ -343,8 +342,6 @@ Les paramètres sont exposés sous `/proc/sys/net/kcc/`. Les écritures déclenc
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | Multiplicateur de bonus d'agrégation ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | Gain STARTUP (≈2,885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | Gain DRAIN (≈0,347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Borne inférieure du trafic en vol (1,0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Borne supérieure du trafic en vol (2,0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | Motif BBRv1 (256 emplacements) | 0/1 | — | Gain de pacing par emplacement |
 | `kcc_cycle_decay_mask[8]` | 0 (tous zéro) | 0 | 0x7FFFFFFF | Bitmap de décroissance 256 bits |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Sortie limitée de sonde montant (0=désactivé) |
@@ -528,7 +525,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              immédiat, règle BBR
     │
-    └──► kcc_set_cwnd()                    BDP + bornes + compensation agg
+    └──► kcc_set_cwnd()                    BDP + compensation agg
 ```
 
 ## Flux Interne du Filtre de Kalman
@@ -671,7 +668,7 @@ où `high_gain ≈ 2.89` est le multiplicateur de pacing BBR STARTUP.
 Activation via `sysctl` :
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
 ```
 
@@ -679,14 +676,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | Paramètre | Défaut | Plage | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Activation principale pour l'injection globale Kalman BDP |
+| \`kcc_kf_enable\` | 1 | 0–1 | Activation principale pour l'injection globale Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numérateur de vitesse dessert (% de la BP en partage équitable) |
-| `kcc_kf_discount_den` | 100 | 1–100000 | Dénominateur de vitesse dessert |
-| `kcc_kf_startup_r_pct` | 20 | 1–100 | Bruit de mesure R% pendant la phase de démarrage |
-| `kcc_kf_steady_r_pct` | 5 | 1–100 | Bruit de mesure R% pendant le régime permanent |
-| `kcc_kf_q_shift` | 20 | 0–30 | Décalage du bruit de processus (Q = 1 << shift) |
-| `kcc_kf_chi2_num` | 384 | 1–100000 | Numérateur du seuil aberrant du chi carré |
-| `kcc_kf_chi2_den` | 100 | 1–100000 | Dénominateur du seuil aberrant du chi carré |
+| \`kcc_kf_discount_den\` | 100 | 1–100000 | Dénominateur de vitesse dessert |
+| \`kcc_kf_steady_mode\` | 0 | 0/1 | — | Mode stable : activé, utilise le pic monotone (kf_x_steady) pour init_bw, ignorant les baisses transitoires du KF |
+| \`kcc_kf_startup_r_pct\` | 20 | 1–100 | Bruit de mesure R% pendant la phase de démarrage |
+| \`kcc_kf_steady_r_pct\` | 5 | 1–100 | Bruit de mesure R% pendant le régime permanent |
+| \`kcc_kf_q_shift\` | 20 | 0–30 | Décalage du bruit de processus (Q = 1 << shift) |
+| \`kcc_kf_chi2_num\` | 384 | 1–100000 | Numérateur du seuil aberrant du chi carré |
+| \`kcc_kf_chi2_den\` | 100 | 1–100000 | Dénominateur du seuil aberrant du chi carré |
+
+Lorsque kcc_kf_steady_mode est activé (1), la bande passante initiale des nouvelles connexions utilise le pic monotone de l'estimation KF (kf_x_steady) au lieu de l'estimation en direct, qui peut avoir baissé depuis la dernière connexion à haut débit. Cela empêche la famine de démarrage à froid sur les chemins stables. Le pic est remis à zéro lors de la désactivation du mode, permettant un redémarrage propre lors de la réactivation.
 
 ### Performance à la Première Seconde (Trans-Pacifique, 212 ms RTT)
 

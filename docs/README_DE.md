@@ -309,7 +309,6 @@ Ratenänderungen werden sofort angewendet (keine Glättung), entsprechend BBR (C
 
 ```
 target = BDP(bw, gain, ext)                       // Basis-BDP
-// Inflight-Grenzen (Nicht-STARTUP: lo~hi-Clamp; STARTUP: nur lo-Untergrenze)
 target = quantization_budget(target)              // TSO-Headroom + gerade Runde + Phase-0-Bonus
 target += ack_agg_bonus + agg_compensation        // ACK-Aggregationskompensation
 
@@ -343,8 +342,6 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK-Aggregations-Bonusmultiplikator |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP-Verstärkung (≈2,885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN-Verstärkung (≈0,347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Inflight-Untergrenze (1,0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Inflight-Obergrenze (2,0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1-Muster (256 Slots) | 0/1 | — | Pro-Slot-Pacing-Verstärkung |
 | `kcc_cycle_decay_mask[8]` | 0 (alle Null) | 0 | 0x7FFFFFFF | 256-Bit-Abfall-Bitmap |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Begrenzte Probe-Up-Beendigung (0=aus) |
@@ -528,7 +525,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              sofortig, BBR-Regel
     │
-    └──► kcc_set_cwnd()                    BDP + Grenzen + Agg-Kompensation
+    └──► kcc_set_cwnd()                    BDP + Agg-Kompensation
 ```
 
 ## Kalman-Filter Interner Ablauf
@@ -671,7 +668,7 @@ wobei `high_gain ≈ 2.89` der BBR-STARTUP-Pacing-Multiplikator ist.
 Aktivierung per `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
 ```
 
@@ -679,14 +676,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | Parameter | Standard | Bereich | Beschreibung |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Master-Aktivierung für die globale Kalman-BDP-Injektion |
+| \`kcc_kf_enable\` | 1 | 0–1 | Master-Aktivierung für die globale Kalman-BDP-Injektion |
 | `kcc_kf_discount_num` | 50 | 0–100 | Dessert-Geschwindigkeitszähler (% der Fair-Share-BW) |
-| `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-Geschwindigkeitsnenner |
-| `kcc_kf_startup_r_pct` | 20 | 1–100 | Messrauschen R% während der Startup-Phase |
-| `kcc_kf_steady_r_pct` | 5 | 1–100 | Messrauschen R% während des stationären Zustands |
-| `kcc_kf_q_shift` | 20 | 0–30 | Prozessrauschen-Shift (Q = 1 << shift) |
-| `kcc_kf_chi2_num` | 384 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Zähler |
-| `kcc_kf_chi2_den` | 100 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Nenner |
+| \`kcc_kf_discount_den\` | 100 | 1–100000 | Dessert-Geschwindigkeitsnenner |
+| \`kcc_kf_steady_mode\` | 0 | 0/1 | — | Steady-Modus: verwendet bei Aktivierung den monoton steigenden Peak (kf_x_steady) für init_bw und ignoriert vorübergehende KF-Absenkungen |
+| \`kcc_kf_startup_r_pct\` | 20 | 1–100 | Messrauschen R% während der Startup-Phase |
+| \`kcc_kf_steady_r_pct\` | 5 | 1–100 | Messrauschen R% während des stationären Zustands |
+| \`kcc_kf_q_shift\` | 20 | 0–30 | Prozessrauschen-Shift (Q = 1 << shift) |
+| \`kcc_kf_chi2_num\` | 384 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Zähler |
+| \`kcc_kf_chi2_den\` | 100 | 1–100000 | Chi-Quadrat-Ausreißerschwelle Nenner |
+
+Wenn kcc_kf_steady_mode aktiviert ist (1), verwendet die anfängliche Bandbreite neuer Verbindungen den monoton steigenden Peak der KF-Schätzung (kf_x_steady) anstelle der Live-Schätzung, die seit der letzten Hochdurchsatz-Verbindung abgesunken sein könnte. Dies verhindert Kaltstart-Mangel auf stabilen Pfaden. Der Peak wird beim Deaktivieren auf Null zurückgesetzt, was einen sauberen Neustart bei erneuter Aktivierung ermöglicht.
 
 ### Leistung in der ersten Sekunde (Trans-Pazifik, 212 ms RTT)
 

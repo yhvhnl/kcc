@@ -1026,13 +1026,14 @@ module_param_cb(kcc_kalman_q_rtt_div, &kcc_param_ops, &kcc_kalman_q_rtt_div, 064
  *   Default: 2885/1000 = 2.885x (BBRv1 standard, Cardwell et al. 2016).
  *
  * kcc_drain_gain_num / kcc_drain_gain_den — pacing gain during DRAIN.
- *   Default: 347/1000 approx 0.347x (BBRv1 drain factor, Cardwell et al. 2016).
+ *   Default: 347/1000 = 0.347x float; 88/256 = 0.344x BBR_UNIT.
+ *   Equals 1/high_gain (1000/2885), per kernel BBR (Cardwell et al. 2016).
  */
 static int kcc_high_gain_num = 2885;                  /* STARTUP pacing gain numerator; corresponds to kernel BBR's BBR_UNIT * 2885 / 1000 ≈ 2.885x high_gain (Cardwell et al. 2016); effective gain = num/den * BBR_UNIT, clamped to 10-bit field; range [0, 100000], BBR default: 2885 */
 module_param_cb(kcc_high_gain_num, &kcc_param_ops, &kcc_high_gain_num, 0644); /* sysctl: kcc_high_gain_num */
 static int kcc_high_gain_den = 1000;                  /* STARTUP pacing gain denominator; range [1, 100000], BBR default: 1000 */
 module_param_cb(kcc_high_gain_den, &kcc_param_ops, &kcc_high_gain_den, 0644); /* sysctl: kcc_high_gain_den */
-static int kcc_drain_gain_num = 347;                  /* DRAIN pacing gain numerator; corresponds to kernel BBR's drain_gain = 1/high_gain ≈ 0.347x (Cardwell et al. 2016); drains queue built during STARTUP; range [0, 100000], BBR default: 347 (1000/2885 ≈ 0.347) */
+static int kcc_drain_gain_num = 347;                  /* DRAIN pacing gain numerator; 347/1000 = 0.347x float = 88 BBR_UNIT (88/256 ≈ 0.344x); 1/high_gain (1000/2885); kernel BBR: bbr_drain_gain = BBR_UNIT * 1000 / 2885 (tcp_bbr1.c:167); range [0, 100000], BBR default: 347 */
 module_param_cb(kcc_drain_gain_num, &kcc_param_ops, &kcc_drain_gain_num, 0644); /* sysctl: kcc_drain_gain_num */
 static int kcc_drain_gain_den = 1000;                 /* DRAIN pacing gain denominator; range [1, 100000], BBR default: 1000 */
 module_param_cb(kcc_drain_gain_den, &kcc_param_ops, &kcc_drain_gain_den, 0644); /* sysctl: kcc_drain_gain_den */
@@ -1073,87 +1074,6 @@ static int kcc_pacing_margin_num = 1;                 /* pacing margin numerator
 module_param_cb(kcc_pacing_margin_num, &kcc_param_ops, &kcc_pacing_margin_num, 0644); /* sysctl: kcc_pacing_margin_num */
 static int kcc_pacing_margin_den = 100;               /* pacing margin denominator; range [1, 100000], BBR default: 100 */
 module_param_cb(kcc_pacing_margin_den, &kcc_param_ops, &kcc_pacing_margin_den, 0644); /* sysctl: kcc_pacing_margin_den */
-
-/* ---- Inflight gain bounds (num/den, percent style) ------------------- */
-/*
- * Inflight bounds clamp the per-ACK cwnd target to [lo, hi] × BDP
- * in non-STARTUP modes (PROBE_BW / DRAIN / PROBE_RTT).
- *
- * ──────────────────────────── LO: 1.0× ─────────────────────────────
- *
- * kcc_inflight_low_gain_num / kcc_inflight_low_gain_den — Lower bound
- * on inflight as multiples of BDP.  Target cwnd ≥ bdp × low_gain.
- *
- *                                                ──────────────────
- * Default 100/100 = 1.0× (BBRv1 parity; deviates from BBRv2's 1.25×).
- *                                                ──────────────────
- *
- * ☆ Why 1.0×, not BBRv2's 1.25×? ☆
- *
- * BBRv2 chose inflight_lo = 1.25× to keep cwnd artificially high on
- * under-buffered paths (cellular / shallow-switch links), where the
- * extra 25 % padding compensates for transient ACK gaps and rapid
- * buffer drain.  Two implicit assumptions:
- *
- *   1. A single flow is the dominant consumer.
- *   2. Path buffers are smaller than 1 BDP.
- *
- * Neither holds for a general-purpose CC algorithm on modern
- * inter-datacentre / inter-continent links (adequate buffer sizing,
- * tens to hundreds of concurrent flows).
- *
- * The 1.25× aggregate-overcommitment pathology:
- *
- *   bottleneck_BW = B, concurrent flows = N.
- *
- *   Each flow's BDP estimate converges to ≈ B / N.
- *   With inflight_lo = 1.25×:   Σ inflight_floor = 1.25 × B
- *   With inflight_lo = 1.0 ×:   Σ inflight_floor = 1.00 × B
- *
- *   The 25 % per-flow padding MULTIPLIES with N — 8 flows produce
- *   200 % aggregate excess inflight.  The bottleneck queue never
- *   drains, inflight rarely drops below 1.25×BDP per flow, and
- *   the 1.25× floor backfires: it causes persistent queueing loss
- *   that costs more throughput than the padding was meant to protect.
- *
- * ─────────────────────────────────────────────────────────────────────
- * Multi-round A/B test (8 × flow, 60 s each, ~1 Gbps bottleneck):
- *
- *   1.0×  Run 1: 1.06 Gbps     Run 2: 1.12 Gbps     (mean ≈ 1.09 Gbps)
- *   1.25× Run 1: 1.02 Gbps     Run 2: 1.02 Gbps     (mean ≈ 1.02 Gbps)
- *                     Δ ≈ +7 % aggregate throughput at 1.0×.
- *
- *   Retransmission counts are comparable (±5 %), confirming that
- *   1.0× does not sacrifice loss resilience — it eliminates the
- *   self-inflicted loss from aggregate overcommitment.
- * ─────────────────────────────────────────────────────────────────────
- *
- * On single-flow paths (N = 1) the inflight_low bound is a floor,
- * not a ceiling.  PROBE_BW's up-phase pacing gain (1.25×) still
- * drives cwnd above BDP; the 1.0× floor only acts during the
- * down-phase to prevent cwnd from collapsing below the true pipe
- * capacity.  Single-flow throughput is therefore unaffected by
- * this change.
- *
- * In addition, KCC already compensates for cold-start / under-
- * buffered conditions through the Kalman-Filter bandwidth injection
- * (dessert-speed startup; see kcc_kf_get_init_bw), making a
- * hard-coded 1.25× cwnd pad redundant and counterproductive.
- *
- * ───────────────────────────── HI: 2.0× ──────────────────────────────
- *
- * kcc_inflight_high_gain_num / kcc_inflight_high_gain_den — Upper bound
- * on inflight in non-STARTUP modes.  Target cwnd ≤ bdp × high_gain.
- * Default 200/100 = 2.0× (BBRv1 standard).
- */
-static int kcc_inflight_low_gain_num = 100;           /* inflight lower bound numerator (100/100 = 1.0x BDP); clamps the minimum per-ACK cwnd target in non-STARTUP modes to at least bdp * low_gain; KCC defaults to 1.0x vs BBRv2's 1.25x (see block comment for rationale); range [0, 100000], BBR default: BBRv1 has no explicit inflight floor (implicitly ~1.0x) */
-module_param_cb(kcc_inflight_low_gain_num, &kcc_param_ops, &kcc_inflight_low_gain_num, 0644); /* sysctl: kcc_inflight_low_gain_num */
-static int kcc_inflight_low_gain_den = 100;           /* inflight lower bound denominator; range [1, 100000], BBR default: 100 */
-module_param_cb(kcc_inflight_low_gain_den, &kcc_param_ops, &kcc_inflight_low_gain_den, 0644); /* sysctl: kcc_inflight_low_gain_den */
-static int kcc_inflight_high_gain_num = 200;          /* inflight upper bound numerator (200/100 = 2.0x BDP); caps the maximum per-ACK cwnd target in non-STARTUP modes; corresponds to kernel BBR's 2x BDP inflight cap (bbr_inflight_hi = 2*BDP); range [0, 100000], BBR default: 200 (2x) */
-module_param_cb(kcc_inflight_high_gain_num, &kcc_param_ops, &kcc_inflight_high_gain_num, 0644); /* sysctl: kcc_inflight_high_gain_num */
-static int kcc_inflight_high_gain_den = 100;          /* inflight upper bound denominator; range [1, 100000], BBR default: 100 */
-module_param_cb(kcc_inflight_high_gain_den, &kcc_param_ops, &kcc_inflight_high_gain_den, 0644); /* sysctl: kcc_inflight_high_gain_den */
 
 /* ---- Kalman filter bounds (int) -------------------------------------- */
 /*
@@ -1206,13 +1126,13 @@ module_param_cb(kcc_kalman_min_samples, &kcc_param_ops, &kcc_kalman_min_samples,
 /* ---- Global Kalman BDP filter (cross-connection bandwidth estimation) ---- */
 /*
  * kcc_kf_enable — Master enable switch for the cross-connection
- *     Global Kalman BDP filter.  When 0 (default), each connection
- *     uses its own per-connection Kalman estimate for BDP calculation.
- *     When 1, the global KF estimate overrides per-connection BDP,
- *     enabling fair-share bandwidth allocation across all connections
- *     sharing a bottleneck.  Default 0 (off).
+ *     Global Kalman BDP filter.  When 1 (default), all connections
+ *     share a single KF estimate of the bottleneck fair-share bandwidth,
+ *     enabling dessert-speed cold-start injection and multi-flow BDP
+ *     coordination.  When 0, each connection uses only its own per-ACK
+ *     bandwidth samples for BDP calculation.  Default 1 (on).
  */
-static int kcc_kf_enable = 0;                         /* master enable switch for cross-connection Global Kalman BDP filter (0=off, 1=on); KCC-only: kernel BBR has no cross-connection bandwidth sharing; when enabled, the global KF estimate overrides per-connection BDP for fair-share bandwidth allocation across all connections sharing a bottleneck; range [0, 1], BBR default: N/A (no cross-connection KF) */
+static int kcc_kf_enable = 1;                         /* master enable switch for cross-connection Global Kalman BDP filter (0=off, 1=on); KCC-only: kernel BBR has no cross-connection bandwidth sharing; when enabled, the global KF estimate overrides per-connection BDP for fair-share bandwidth allocation across all connections sharing a bottleneck; range [0, 1], BBR default: N/A (no cross-connection KF) */
 module_param_cb(kcc_kf_enable, &kcc_param_ops, &kcc_kf_enable, 0644); /* sysctl: kcc_kf_enable */
 /*
  * kcc_kf_startup_r_pct — Measurement noise R as percentage of the
@@ -1301,6 +1221,24 @@ static int kcc_kf_discount_num = 50;                  /* global KF fair-share di
 module_param_cb(kcc_kf_discount_num, &kcc_param_ops, &kcc_kf_discount_num, 0644); /* sysctl: kcc_kf_discount_num */
 static int kcc_kf_discount_den = 100;                 /* global KF fair-share discount denominator; paired with numerator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kf_discount_den, &kcc_param_ops, &kcc_kf_discount_den, 0644); /* sysctl: kcc_kf_discount_den */
+
+/* ---- Global Kalman BDP steady-mode switch ------------------------- */
+/*
+ * kcc_kf_steady_mode — When 0 (default), init_bw tracks the live KF
+ * estimate, which can drift downward between connections, causing
+ * variable cold-start injection.  When 1, init_bw uses the long-term
+ * peak (kcc_kf_x_steady, monotonic max ever observed) directly:
+ *
+ *   fair = max(kf_x, kf_x_steady)
+ *
+ * The peak provides a stable upper baseline for cold-start injection
+ * that is not polluted by transient dips in the live KF estimate.
+ *
+ * kf_x_steady is zeroed automatically when mode is switched off,
+ * giving a clean slate on the next re-enable.
+ */
+static int kcc_kf_steady_mode = 0;                    /* 0=dynamic tracking; 1=use monotonic peak for init_bw; range [0,1]; KCC-only; default 0 */
+module_param_cb(kcc_kf_steady_mode, &kcc_param_ops, &kcc_kf_steady_mode, 0644); /* sysctl: kcc_kf_steady_mode */
 
 /* ---- RTT sample bounds (us, int) ------------------------------------- */
 /*
@@ -2099,13 +2037,11 @@ static int kcc_gain_proc_handler(struct ctl_table* ctl, int write, /* custom sys
 /* Derived scalars — all populated by kcc_init_module_params() */
 static u32 kcc_extra_acked_gain_val;                       /* ACK-agg gain in BBR_UNIT (computed at module init) */
 static u32 kcc_high_gain_val;                              /* STARTUP pacing gain in BBR_UNIT (computed at module init) */
-static u32 kcc_drain_gain_val;                             /* DRAIN pacing gain in BBR_UNIT (computed at module init) */
+static u32 kcc_drain_gain_val;                             /* DRAIN pacing gain, 88/256 ≈ 0.344x (computed at module init) */
 static u32 kcc_probe_bw_cycle_len_val;                     /* clamped & power-of-two cycle length (computed at module init) */
 static u32 kcc_full_bw_thresh_val;                         /* full-BW detection threshold in BBR_UNIT (computed at module init) */
 static u32 kcc_full_bw_cnt_val;                            /* clamped full-BW round count (computed at module init) */
 
-static u32 kcc_inflight_low_gain_val;                      /* inflight lower bound in BBR_UNIT (computed at module init) */
-static u32 kcc_inflight_high_gain_val;                     /* inflight upper bound in BBR_UNIT (computed at module init) */
 static u32 kcc_kalman_p_est_max_val;                       /* clamped p_est max (computed at module init) */
 static u32 kcc_kalman_converged_p_est_val;                  /* clamped convergence p_est (computed at module init) */
 static u32 kcc_recal_p_est_thresh_val;                     /* clamped recalibration p_est threshold (computed at module init) */
@@ -2240,7 +2176,25 @@ static u64 kcc_kf_chi2_num_val;                          /* cached chi2 innovati
 static u64 kcc_kf_chi2_den_val;                          /* cached chi2 innovation gate denominator (computed at module init) */
 static u32 kcc_kf_discount_num_val;                      /* cached fair-share discount numerator (computed at module init) */
 static u32 kcc_kf_discount_den_val;                      /* cached fair-share discount denominator (computed at module init) */
+static u32 kcc_kf_steady_mode_val;                       /* cached steady-mode switch [0,1] (computed at module init) */
 
+/* ---- Global Kalman BDP atomic state (cross-connection) ---------------- */
+/*
+ * KF atomic globals: shared across all KCC connections on this host.
+ * Using atomic types because the Kalman filter runs in softirq context
+ * without per-connection locks — the estimation target (available
+ * bandwidth on the bottleneck) is a shared resource.
+ *   kcc_kf_x        — posterior state estimate (BW_UNIT)
+ *   kcc_kf_P        — posterior error covariance
+ *   kcc_kf_x_steady — monotonic peak for steady-mode init_bw (BW_UNIT)
+ *   kcc_kf_active   — 1 = filter has been seeded with at least one sample
+ */
+static atomic64_t kcc_kf_x = ATOMIC64_INIT(0);          /* global available BW estimate (BW_UNIT) */
+static atomic64_t kcc_kf_P = ATOMIC64_INIT(0);          /* error covariance (initial uncertainty) */
+static atomic64_t kcc_kf_x_steady = ATOMIC64_INIT(0);   /* steady-mode peak floor: monotonic max (BW_UNIT) */
+static atomic_t kcc_kf_active = ATOMIC_INIT(0);         /* 1 = filter has been seeded (cold-start guard) */
+
+/* ---- Module init + derived scalar computation ----------------------- */
 /*
  * kcc_init_module_params - Validate all raw module parameters against
  * their legal ranges, clamp out-of-bounds values, and compute all
@@ -2288,11 +2242,6 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     kcc_pacing_margin_num = clamp(kcc_pacing_margin_num, 0, 50);        /* pacing margin num [0, 50], prevent >=100% */
     kcc_pacing_margin_den = clamp(kcc_pacing_margin_den, 1, 100000);    /* pacing margin den [1, 100k] */
-
-    kcc_inflight_low_gain_num = clamp(kcc_inflight_low_gain_num, 0, 100000);   /* inflight lo num [0, 100k] */
-    kcc_inflight_low_gain_den = clamp(kcc_inflight_low_gain_den, 1, 100000);   /* inflight lo den [1, 100k] */
-    kcc_inflight_high_gain_num = clamp(kcc_inflight_high_gain_num, 0, 100000); /* inflight hi num [0, 100k] */
-    kcc_inflight_high_gain_den = clamp(kcc_inflight_high_gain_den, 1, 100000); /* inflight hi den [1, 100k] */
 
     kcc_kalman_p_est_max = clamp(kcc_kalman_p_est_max, 1, 100000000);  /* p_est max [1, 100M] */
     kcc_kalman_converged_p_est = clamp(kcc_kalman_converged_p_est, 1, 1000000); /* convergence p_est [1, 1M] */
@@ -2479,16 +2428,12 @@ static void kcc_init_module_params(void)                          /* clamp all p
      * overflow in the 10-bit pacing_gain field.
      */
     kcc_high_gain_val = min_t(u32, (u32)((u64)BBR_UNIT * (u32)kcc_high_gain_num / (u32)kcc_high_gain_den) + 1, KCC_GAIN_MAX); /* floor+1: match BBR 256*2885/1000+1=739 */
-    kcc_drain_gain_val = min_t(u32, (u32)((u64)BBR_UNIT * (u32)kcc_drain_gain_num / (u32)kcc_drain_gain_den), KCC_GAIN_MAX); /* floor: match BBR truncation, 347/1000=0.347→88 (BBR: 1000/2885=0.3467→88) */
+    kcc_drain_gain_val = min_t(u32, (u32)((u64)BBR_UNIT * (u32)kcc_drain_gain_num / (u32)kcc_drain_gain_den), KCC_GAIN_MAX); /* 347/1000 = 0.347x float = 88 BBR_UNIT (88/256 ≈ 0.344x); kernel BBR: tcp_bbr1.c:167 bbr_drain_gain = BBR_UNIT * 1000 / 2885 → 88 */
 
     /* Cycle length and full-BW threshold */
     kcc_probe_bw_cycle_len_val = (u32)kcc_probe_bw_cycle_len;     /* publish cycle length */
     kcc_full_bw_thresh_val = (u32)((u64)BBR_UNIT * (u32)kcc_full_bw_thresh_num / (u32)kcc_full_bw_thresh_den); /* num/den * BBR_UNIT */
     kcc_full_bw_cnt_val = (u32)kcc_full_bw_cnt;                                  /* publish full-BW round count (already clamped to [1,3] at line 1638, fits 2-bit field) */
-
-    /* Inflight bounds as BBR_UNIT multiples */
-    kcc_inflight_low_gain_val = (u32)((u64)BBR_UNIT * (u32)kcc_inflight_low_gain_num / (u32)kcc_inflight_low_gain_den); /* num/den * BBR_UNIT */
-    kcc_inflight_high_gain_val = (u32)((u64)BBR_UNIT * (u32)kcc_inflight_high_gain_num / (u32)kcc_inflight_high_gain_den); /* num/den * BBR_UNIT */
 
     /* Kalman clamped scalars (Kalman 1960) */
     kcc_kalman_p_est_max_val = (u32)kcc_kalman_p_est_max;         /* publish p_est max */
@@ -2761,6 +2706,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kf_chi2_den = clamp(kcc_kf_chi2_den, 1, 100000);                     /* chi2 den [1, 100k] */
     kcc_kf_discount_num = clamp(kcc_kf_discount_num, 0, 100);                /* discount num [0, 100] */
     kcc_kf_discount_den = clamp(kcc_kf_discount_den, 1, 100000);             /* discount den [1, 100k] */
+    kcc_kf_steady_mode = clamp(kcc_kf_steady_mode, 0, 1);                   /* steady mode [0, 1] */
     kcc_kf_enable_val = (u32)kcc_kf_enable;                                  /* publish KF enable */
     kcc_kf_startup_r_pct_val = (u32)kcc_kf_startup_r_pct;                    /* publish startup R pct */
     kcc_kf_steady_r_pct_val = (u32)kcc_kf_steady_r_pct;                      /* publish steady R pct */
@@ -2769,6 +2715,11 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kf_chi2_den_val = (u64)kcc_kf_chi2_den;                              /* publish chi2 den */
     kcc_kf_discount_num_val = (u32)kcc_kf_discount_num;                      /* publish discount num */
     kcc_kf_discount_den_val = (u32)kcc_kf_discount_den;                      /* publish discount den */
+    kcc_kf_steady_mode_val = (u32)kcc_kf_steady_mode;                       /* publish steady mode */
+    /* Steady-mode off → reset peak floor: clean slate on next re-enable. */
+    if (kcc_kf_steady_mode != 1) {
+        atomic64_set(&kcc_kf_x_steady, 0);
+    }
 
     kcc_bw_rt_cycle_len_val = kcc_bw_rt_cycle_len;                 /* publish BW RT cycle length */
     kcc_cwnd_min_target_val = kcc_cwnd_min_target;                 /* publish min cwnd target */
@@ -2777,20 +2728,6 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_ack_epoch_max = clamp(kcc_ack_epoch_max, 65536, 0x7FFFFFFF);         /* clamp epoch cap [64K, 2G] */
     kcc_ack_epoch_max_val = (u32)kcc_ack_epoch_max;                 /* publish epoch cap */
 }                                                                             /* kcc_init_module_params */
-
-/* ---- Global Kalman BDP atomic state (cross-connection) ---------------- */
-/*
- * KF atomic globals: shared across all KCC connections on this host.
- * Using atomic types because the Kalman filter runs in softirq context
- * without per-connection locks — the estimation target (available
- * bandwidth on the bottleneck) is a shared resource.
- *   kcc_kf_x      — posterior state estimate (BW_UNIT)
- *   kcc_kf_P      — posterior error covariance
- *   kcc_kf_active — 1 = filter has been seeded with at least one sample
- */
-static atomic64_t kcc_kf_x = ATOMIC64_INIT(0);          /* global available BW estimate (BW_UNIT) */
-static atomic64_t kcc_kf_P = ATOMIC64_INIT(0);          /* error covariance (initial uncertainty) */
-static atomic_t kcc_kf_active = ATOMIC_INIT(0);         /* 1 = filter has been seeded (cold-start guard) */
 
 /* ---- Forward Declarations -------------------------------------------- */
 static void kcc_check_probe_rtt_done(struct sock* sk);                        /* forward: check PROBE_RTT exit */
@@ -3785,11 +3722,6 @@ static void kcc_advance_cycle_phase(struct sock* sk)                           /
     /* Wrap cycle_idx: (idx + 1) % cycle_len, using mask since len is power-of-two */
     kcc->cycle_idx = (kcc->cycle_idx + 1) & (kcc_probe_bw_cycle_len_val - 1); /* advance + wrap */
     kcc_set_cycle_mstamp(kcc, tp->delivered_mstamp);                          /* mark phase start time */
-
-    /* pacing_gain is set by the mode-specific block in kcc_update_model()
-     * after all phase-advance and mode-transition logic completes.
-     * Setting it here is redundant (always overwritten by the caller)
-     * and wastes hot-path cycles on every PROBE_BW phase advance. */
 }
 /*
  * kcc_update_dyn_probe_interval - Recompute the dynamic PROBE_RTT interval
@@ -4112,57 +4044,110 @@ static bool kcc_set_cwnd_to_recover_or_restore(                                 
 /* ---- CWND Setting (Cardwell et al. 2016) ----------------------------- */
 
 /*
- * kcc_set_cwnd - Update the congestion window on each ACK.
+ * kcc_set_cwnd — Update the congestion window on each ACK.
  *
  * @sk:    TCP socket.
  * @rs:    rate sample.
- * @acked: segments ACKed (rs->acked_sacked, not bytes).  u32 matches
- *         the type of rs->acked_sacked in the kernel's rate_sample struct.
+ * @acked: segments ACKed (rs->acked_sacked), u32 matches kernel rate_sample.
  * @bw:    bandwidth estimate in BW_UNIT.
- * @gain:  current cwnd_gain in BBR_UNIT.  'int' matches kernel BBR's
- *         convention for gain parameters (signed for delta arithmetic).
- * @ext:   extended state (for Kalman RTT in kcc_bdp, ACK-agg compensation).
+ * @gain:  current cwnd_gain in BBR_UNIT.  int — matches kernel BBR convention;
+ *         signed allows delta arithmetic (e.g. drain gain below 1.0x).
+ * @ext:   extended state (Kalman RTT for BDP, ACK-agg compensation).
  *
- * Algorithm (standard BBR per-ACK cwnd update, Cardwell et al. 2016):
- *   1. Skip if no data ACKed (acked_segs == 0).
- *   2. Handle recovery entry/exit via kcc_set_cwnd_to_recover_or_restore().
- *   3. Compute BDP target = quantization_budget(BDP(bw, gain, ext)).
- *   4. Apply inflight bounds:
- *      - STARTUP: lower-bound target at BDP * inflight_low_gain (no upper bound).
- *      - Other modes: clamp target between [lo, hi].
- *   5. Add ACK aggregation bonuses (standard + confidence-gated).
- *   6. CWND progression:
- *      - full_bw_reached: cwnd = min(cwnd + acked, target)  (convergent).
- *      - STARTUP:         cwnd = cwnd + acked               (exponential probe).
- *   7. Floor at cwnd_min_target.
- *   8. If PROBE_RTT just ended (probe_rtt_restored): restore prior_cwnd.
- *   9. Clamp to snd_cwnd_clamp.
- *  10. In PROBE_RTT mode: enforce cap at cwnd_min_target (min inflight).
+ * ───────────────────────────────────────────────────────────────────────
+ * Design reasoning
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ * (1) No inflight bounds — follow kernel BBR v5.4
+ *
+ * Kernel BBR's bbr_set_cwnd() has no explicit inflight lo/hi bounds.
+ * BBRv2 added a cwnd floor (1.25x BDP) and ceiling (2.0x BDP), but
+ * BBRv1/v5.4 relies on natural ACK-clock convergence:
+ *
+ *   full_bw:   cwnd = min(cwnd + acked, target)
+ *   STARTUP:   cwnd = cwnd + acked
+ *
+ * The ceiling is implicit — ACK arrival rate is the send rate.
+ * The floor is bbr_cwnd_min_target (4 segments) — keepalive, not performance.
+ *
+ * Why the inflight bounds were removed:
+ *
+ * Lower bound (1.0x BDP):
+ *   At cruise, gain == BBR_UNIT so BDP × 1.0 equals BDP itself —
+ *   the bound is neutral.  At drain, pacing_gain = 88/256 ≈ 0.344x,
+ *   the bound would prevent queue drainage — which is the entire
+ *   purpose of the drain phase.
+ *
+ * Upper bound (2.0x BDP):
+ *   Kernel BBR has a 2x BDP inflight cap in the *pacing* path
+ *   (bbr_inflight_hi_from_bw), not the cwnd path.  Placing it in
+ *   the cwnd path violates the original design's separation of concerns.
+ *
+ * (2) Kalman BDP — kcc_bdp() uses Kalman RTT, not raw min_rtt
+ *
+ * Kernel BBR's bbr_bdp() uses bbr_min_rtt() — the smallest RTT seen
+ * within the sliding window.
+ *
+ * The problem with min_rtt is not imprecision — it is systematic bias:
+ *
+ *   ACK compression    multiple ACKs can land in the same frame,
+ *                      distorting RTT measurement timestamps
+ *   TSO aggregation    bulk data sent in a single frame → falsely short RTT
+ *   GRO / LRO          receiver-side merging → timestamp displacement
+ *   timer granularity  kernel jiffies or hrtimer resolution injects noise
+ *
+ * These mechanisms conspire to produce a minimum value that is
+ * *smaller than the physical propagation delay*.  Computing BDP
+ * from this minimum gives a pipe that cannot hold — inflight can
+ * exceed it without loss, proving the true pipe is larger.
+ *
+ * Kalman RTT is not "a smoother min_rtt".  It estimates the
+ * *expectation* of the propagation delay, P(true_delay | all_samples) —
+ * a statistically unbiased quantity.  Every sample contains noise;
+ * the Kalman filter separates signal from noise via its
+ * measurement/process model.
+ *
+ * Cost: BDP lands closer to the physical pipe limit → nearer to
+ *   loss thresholds.
+ * Gain: avoids the systematic under-filling that min_rtt causes
+ *   on real-world paths.
+ *
+ * (3) ACK aggregation compensation — dual-layer, confidence-gated
+ *
+ * Layer 1: kcc_ack_aggregation_cwnd()
+ *   Applied unconditionally (whenever bdp_ready) — matches kernel
+ *   BBR's bbr_ack_aggregation_cwnd().
+ *
+ * Layer 2: kcc_agg_cwnd_compensation()
+ *   Activates only when agg_state >= KCC_AGG_CONFIRMED.
+ *   When aggregation is detected, cwnd is expanded to absorb the
+ *   aggregation depth.  The confidence gate prevents over-inflation
+ *   on ambiguous aggregation signals.
+ *   Kernel BBR has no equivalent — it unconditionally adds extra_acked
+ *   to the cwnd target.
+ *
+ * (4) CWND progression policy — BBR's two-phase model
+ *
+ * full_bw_reached (pipe filled) → convergent growth:
+ *   cwnd = min(cwnd + acked, target)
+ *   cwnd grows at ACK rate but capped at the BDP target.
+ *   This is convergent: cwnd → target, no explosion.
+ *
+ * STARTUP (pipe not yet full) → exponential probe:
+ *   cwnd = cwnd + acked
+ *   Each ACK grows cwnd by one segment — effectively slow-start
+ *   until full_bw_reached fires or loss occurs.
+ *
+ * (5) PROBE_RTT cwnd enforcement — independent second pass
+ *
+ * During PROBE_RTT, cwnd must be held at min_target (4 segments)
+ * to probe for a new minimum RTT.  BBR places this check *after*
+ * snd_cwnd_clamp — a second, independent cwnd truncation.  Even if
+ * the global clamp permits a larger value, PROBE_RTT forces the
+ * minimum.
  *
  * Corresponds to kernel BBR v5.4: bbr_set_cwnd().
- * The core logic (steps 1-4, 6-10) is identical to kernel BBR.
- *
- * KCC deviations (within the same overall algorithm):
- *   a) Inflight bound: KCC's inflight_low_gain defaults to 1.0x BDP vs.
- *      BBRv2's 1.25x.  See the long block comment at the inflight gain
- *      parameters (around line 1093) for the multi-flow overcommitment
- *      rationale and A/B test results.
- *   b) ACK aggregation compensation includes a confidence-gated second
- *      layer (kcc_agg_cwnd_compensation) that only activates at high
- *      confidence (agg_state >= CONFIRMED).  Kernel BBR unconditionally
- *      adds extra_acked to the cwnd target.  The confidence gate prevents
- *      over-inflation on ambiguous aggregation signals.
- *   c) BDP target uses kcc_bdp() which may return a Kalman-derived RTT
- *      estimate (see kcc_get_model_rtt).  Kernel BBR always uses the
- *      windowed min_rtt_us.
- *   BENEFIT of (a): Eliminates per-flow 1.25x aggregate overcommitment
- *   on multi-flow paths (each flow's inflated floor sums to N*0.25x BDP
- *   excess inflight).  BENEFIT of (b): Avoids cwnd overshoot on paths
- *   with ambiguous ACK-agg signals.  BENEFIT of (c): Tighter BDP through
- *   unbiased Kalman propagation-delay estimate.
- *
- * Type note: 'bw' is u32 (BW_UNIT), 'gain' is int (BBR_UNIT), 'acked'
- * is u32.  All match kernel BBR's bbr_set_cwnd() parameter types.
+ * Core logic (steps 1–5) is identical to kernel BBR.
  */
 static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs,             /* update snd_cwnd */
     u32 acked, u32 bw, int gain,                                           /* input parameters */
@@ -4172,77 +4157,56 @@ static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs,         
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                  /* get KCC CA state */
     u32 cwnd = tcp_snd_cwnd(tp), target;                                                   /* current cwnd and target */
 
-    if (unlikely(!acked)) {                                                                        /* no data ACKed: uncommon case */
+    /* Step 1: no data ACKed → no cwnd progression */
+    if (unlikely(!acked)) {                                                                        /* uncommon: pure SACK or dupack */
         goto done;                                                                         /* skip to clamp enforcement */
     }
 
+    /* Step 2: recovery entry/exit — packet conservation logic */
     if (kcc_set_cwnd_to_recover_or_restore(sk, rs, acked, &cwnd)) {                       /* handle recovery transitions */
-        goto done;                                                                          /* packet-conservation mode */
+        goto done;                                                                          /* packet conservation active */
     }
 
-    /* Core BDP target (segments) — without quantization budget.
-     * Quantization headroom (TSO/even-round/probe) is added AFTER
-     * inflight bounds to avoid stripping it (see below). */
+    /* Step 3: compute BDP target.
+     * Uses kcc_bdp() which may select Kalman RTT (see reasoning (2) above). */
     target = kcc_bdp(sk, bw, gain, ext);
 
-    /* Inflight bounds (BBR standard, Cardwell et al. 2016).
-     * Apply bounds to the *raw* BDP before adding quantization and
-     * ACK-aggregation bonuses.  This matches BBR behavior where
-     * bbr_quantization_budget() adds headroom on top of the
-     * already-bounded target_cwnd. */
+    /* Step 4: quantization headroom + ACK aggregation.
+     * Follows kernel BBR order: BDP → quantization → aggregation.
+     * Confidence-gated second layer only activates at CONFIRMED (reasoning (3)). */
     {
-        bool bdp_ready = (kcc->min_rtt_us != KCC_MIN_RTT_UNINIT && bw > 0);   /* min_rtt_us > 0 implied by != UNINIT (UNINIT = ~0U) */
+        bool bdp_ready = (kcc->min_rtt_us != KCC_MIN_RTT_UNINIT && bw > 0);   /* min_rtt valid AND BW estimated */
+        target = kcc_quantization_budget(sk, target);                                   /* TSO/even-round headroom */
+
         if (likely(bdp_ready)) {
-            u64 bdp = ((u64)bw * kcc->min_rtt_us) >> BW_SCALE;
-            u32 lo = max_t(u32, TCP_INIT_CWND,
-                mul_u64_u32_shr(bdp, kcc_inflight_low_gain_val, BBR_SCALE));
-            if (kcc->mode == KCC_STARTUP) {
-                target = max_t(u32, target, lo);
-            }
-            else {
-                u32 hi_gain = max_t(u32, kcc->cwnd_gain, kcc_inflight_high_gain_val);  /* ≥ runtime cwnd_gain for safety */
-                u32 hi = max_t(u32, lo,
-                    mul_u64_u32_shr(bdp, hi_gain, BBR_SCALE));
-                target = clamp(target, lo, hi);
-            }
-        }
-        /* Now add quantization headroom on top of the bounded target.
-         * This matches BBR's order: bdp() → bounded → quantization(). */
-        target = kcc_quantization_budget(sk, target);
-        /* Inflight bounds valid: add ACK aggregation bonuses */
-        if (likely(bdp_ready)) {
-            target += kcc_ack_aggregation_cwnd(sk, ext, bw);
+            target += kcc_ack_aggregation_cwnd(sk, ext, bw);                             /* BBR standard aggregation */
 
             /* ACK aggregation compensation: confidence-gated second layer */
-            if (kcc_agg_enable_val && ext && ext->agg_state >= KCC_AGG_CONFIRMED) {
-                u32 agg_comp = kcc_agg_cwnd_compensation(sk, ext, ext->agg_extra_acked, ext->agg_confidence, bw);
-                target = min_t(u32, target + agg_comp, tp->snd_cwnd_clamp);
+            if (kcc_agg_enable_val && ext && ext->agg_state >= KCC_AGG_CONFIRMED) {      /* confidence gate */
+                u32 agg_comp = kcc_agg_cwnd_compensation(sk, ext, ext->agg_extra_acked,
+                    ext->agg_confidence, bw);
+                target = min_t(u32, target + agg_comp, tp->snd_cwnd_clamp);              /* cap at global clamp */
             }
         }
     }
 
-    /*
-     * CWND progression policy:
-     * - full_bw_reached: converge to target.
-     *   cwnd = min(cwnd + acked, target)
-     * - STARTUP (not yet full): exponential ramp.
-     *   cwnd = cwnd + acked (unbounded above; inflight_bounds prevent overshoot)
-     */
-    if (likely(kcc_full_bw_reached(sk))) {                                                              /* pipe full: converge to target */
-        cwnd = min(cwnd + acked, target);                                                          /* converge upward to target */
+    /* Step 5: cwnd progression — convergent or exponential (reasoning (4)) */
+    if (likely(kcc_full_bw_reached(sk))) {                                              /* pipe full */
+        cwnd = min(cwnd + acked, target);                                          /* converge to BDP target */
     }
-    else if (unlikely(cwnd < target || tp->delivered < TCP_INIT_CWND)) {                                        /* STARTUP: growth needed */
-        cwnd = cwnd + acked;                                                                               /* exponential ramp */
+    else if (unlikely(cwnd < target || tp->delivered < TCP_INIT_CWND)) {                   /* STARTUP: needs growth */
+        cwnd = cwnd + acked;                                                               /* exponential ramp */
     }
 
-    cwnd = max(cwnd, kcc_cwnd_min_target_val);                                         /* floor at min cwnd */
+    cwnd = max(cwnd, kcc_cwnd_min_target_val);                                         /* floor: never below min cwnd */
 
 done:
-    tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));
+    tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));                               /* global cap */
 
-    /* PROBE_RTT enforcement: keep cwnd at minimum to drain the pipe */
+    /* Step 6: PROBE_RTT enforcement (reasoning (5)).
+     * Second cwnd cap — PROBE_RTT must drain pipe to probe min_rtt. */
     if (unlikely(kcc->mode == KCC_PROBE_RTT)) {
-        tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), kcc_cwnd_min_target_val));
+        tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), kcc_cwnd_min_target_val));           /* force 4-segment minimum */
     }
 }
 /* ---- Cycle Phase Check (Cardwell et al. 2016) ------------------------ */
@@ -6697,7 +6661,7 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,     
         kcc->cwnd_gain = kcc_high_gain_val;                                        /* cwnd_gain approx 2.89x */
         break;                                                                                   /* exit switch */
     case KCC_DRAIN:                                                                              /* DRAIN mode */
-        kcc->pacing_gain = kcc_drain_gain_val;                                        /* pacing_gain approx 0.35x */
+        kcc->pacing_gain = kcc_drain_gain_val;                                        /* pacing_gain = 88/256 ≈ 0.344x */
         kcc->cwnd_gain = kcc_high_gain_val;                                            /* cwnd at high_gain to keep cwnd (match BBR, Cardwell et al. 2016) */
         break;                                                                                     /* exit switch */
     case KCC_PROBE_BW:                                                                             /* PROBE_BW mode */
@@ -6755,6 +6719,7 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,     
  * The flag is cleared when any queue, ECN, or aggregation signal
  * appears during a cruise-phase evaluation — restoring full KCC
  * protection.
+ */
 static void kcc_alone_on_path_eval(struct sock* sk,                            /* evaluate single-flow heuristic */
     struct kcc_ext* ext)                                                       /* extended state */
 {
@@ -7055,6 +7020,12 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
     if (x > 0) {                                                             /* valid estimate (positive BW) */
         atomic64_set(&kcc_kf_x, x);                                          /* publish new bandwidth estimate */
         atomic64_set(&kcc_kf_P, P);                                          /* publish new covariance */
+
+        /* Steady-mode peak: monotonic max — never decays.
+         * Provides the absolute ceiling for init_bw injection. */
+        if (kcc_kf_steady_mode_val && x > (u64)atomic64_read(&kcc_kf_x_steady)) {
+            atomic64_set(&kcc_kf_x_steady, x);
+        }
     }
     return x;                                                                /* return updated estimate to caller */
 }
@@ -7089,6 +7060,20 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)                   /* compute boot
     fair = (u64)atomic64_read(&kcc_kf_x);                                /* read global fair-share estimate */
     if (fair == 0) {                                                     /* estimate is zero */
         return 0;                                                        /* no useful information */
+    }
+
+    /* Steady-mode: use the long-term peak directly instead of the
+     * live KF estimate.  kf_x tracks fair-share bandwidth and can
+     * drift too low for cold-start injection.  kf_x_steady is the
+     * monotonic max ever observed — a conservative but meaningful
+     * floor for init_bw.
+     *
+     * When steady_mode is off (0), fair stays at kf_x — fully dynamic.
+     * kf_x_steady is zeroed in kcc_init_module_params on mode disable. */
+    if (kcc_kf_steady_mode_val) {
+        u64 peak = (u64)atomic64_read(&kcc_kf_x_steady);
+        if (peak > fair)
+            fair = peak;
     }
 
     /* Discount and gain-compensate:
@@ -7605,11 +7590,6 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     /* Pacing margin */
     {.procname = "kcc_pacing_margin_num",       .data = &kcc_pacing_margin_num,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..50] pacing margin numerator; divisor=100-num*100/den; BBR default: 1 (1%) */
     {.procname = "kcc_pacing_margin_den",       .data = &kcc_pacing_margin_den,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] pacing margin denominator; BBR default: 100 */
-    /* Inflight gain bounds */
-    {.procname = "kcc_inflight_low_gain_num",   .data = &kcc_inflight_low_gain_num,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100000] inflight lower bound numerator (default 100 = 1.0x BDP); KCC: 1.0x vs BBRv2's 1.25x */
-    {.procname = "kcc_inflight_low_gain_den",   .data = &kcc_inflight_low_gain_den,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] inflight lower bound denominator; BBR default: 100 */
-    {.procname = "kcc_inflight_high_gain_num",  .data = &kcc_inflight_high_gain_num,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100000] inflight upper bound numerator (default 200 = 2.0x BDP); BBR default: 200 */
-    {.procname = "kcc_inflight_high_gain_den",  .data = &kcc_inflight_high_gain_den,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] inflight upper bound denominator; BBR default: 100 */
     /* Kalman bounds (Kalman 1960) */
     {.procname = "kcc_kalman_p_est_max",        .data = &kcc_kalman_p_est_max,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100M] p_est absolute max covariance; KCC-only; default 1,000,000 */
     {.procname = "kcc_kalman_converged_p_est",  .data = &kcc_kalman_converged_p_est,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1M] p_est convergence threshold; KCC-only; default 500 */
@@ -7751,7 +7731,7 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_tso_segs_default",      .data = &kcc_tso_segs_default,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] TSO segments at normal pacing rate; BBR default: 2 */
     {.procname = "kcc_extra_acked_win_rtts_max", .data = &kcc_extra_acked_win_rtts_max, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535 RTTs] max dual-window RTTs before rotation; KCC-only; default 31 */
     /* Global Kalman BDP filter (cross-connection bandwidth estimation) */
-    {.procname = "kcc_kf_enable",              .data = &kcc_kf_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] global Kalman BDP enable; KCC-only; default 0=off */
+    {.procname = "kcc_kf_enable",              .data = &kcc_kf_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] global Kalman BDP enable; KCC-only; default 1=on */
     {.procname = "kcc_kf_startup_r_pct",       .data = &kcc_kf_startup_r_pct,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100%] startup R measurement noise pct; KCC-only; default 20 */
     {.procname = "kcc_kf_steady_r_pct",        .data = &kcc_kf_steady_r_pct,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100%] steady-state R measurement noise pct; KCC-only; default 5 */
     {.procname = "kcc_kf_q_shift",             .data = &kcc_kf_q_shift,             .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..30] process noise shift (Q = 1<<shift); KCC-only; default 20 */
@@ -7759,6 +7739,7 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_kf_chi2_den",            .data = &kcc_kf_chi2_den,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] chi-squared innovation gate den; KCC-only; default 100 */
     {.procname = "kcc_kf_discount_num",        .data = &kcc_kf_discount_num,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] fair-share discount numerator (%); KCC-only; default 50 */
     {.procname = "kcc_kf_discount_den",        .data = &kcc_kf_discount_den,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] fair-share discount denominator; KCC-only; default 100 */
+    {.procname = "kcc_kf_steady_mode",         .data = &kcc_kf_steady_mode,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] use monotonic peak for init_bw; KCC-only; default 0=off */
     {} /* sentinel: end of table */
 }; /* end of kcc_ctl_table[] */
 /*

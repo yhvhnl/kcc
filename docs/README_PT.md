@@ -308,7 +308,6 @@ Mudanças de taxa são aplicadas imediatamente (sem suavização), igual ao BBR 
 
 ```
 target = BDP(bw, gain, ext)                       // BDP base
-// limites de tráfego em voo (não-STARTUP: clamp lo~hi; STARTUP: apenas piso lo)
 target = quantization_budget(target)              // margem TSO + arredondamento + bônus fase-0
 target += ack_agg_bonus + agg_compensation        // compensação de agregação ACK
 
@@ -342,8 +341,6 @@ Parâmetros são expostos em `/proc/sys/net/kcc/`. Escritas acionam `kcc_init_mo
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | Multiplicador de bônus de agregação ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | Ganho STARTUP (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | Ganho DRAIN (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Limite inferior de tráfego em voo (1.0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Limite superior de tráfego em voo (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | Padrão BBRv1 (256 slots) | 0/1 | — | Ganho de pacing por slot |
 | `kcc_cycle_decay_mask[8]` | 0 (todos zero) | 0 | 0x7FFFFFFF | Bitmap de decaimento de 256 bits |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Saída limitada de sondagem ascendente (0=desligado) |
@@ -531,7 +528,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              imediato, regra BBR
     │
-    └──► kcc_set_cwnd()                    BDP + limites + compensação de agregação
+    └──► kcc_set_cwnd()                    BDP + compensação de agregação
 ```
 
 ## Fluxo Interno do Filtro de Kalman
@@ -676,7 +673,7 @@ onde `high_gain ≈ 2.89` é o multiplicador de pacing do STARTUP do BBR.
 Habilitar via `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # habilitação mestre (padrão 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # habilitação mestre (padrão 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador da velocidade de sobremesa (padrão 50, faixa 35–75)
 ```
 
@@ -684,14 +681,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador da velocidade de sobremes
 
 | Parâmetro | Padrão | Faixa | Descrição |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Habilitação mestre para injeção global Kalman BDP |
+| `kcc_kf_enable` | 1 | 0–1 | Habilitação mestre para injeção global Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numerador da velocidade de sobremesa (% do BW de divisão justa) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | Denominador da velocidade de sobremesa |
+| `kcc_kf_steady_mode` | 0 | 0/1 | — | Modo estável: ativado, usa o pico monotônico (kf_x_steady) para init_bw, ignorando quedas transitórias do KF |
 | `kcc_kf_startup_r_pct` | 20 | 1–100 | R% de ruído de medição durante a fase de inicialização |
 | `kcc_kf_steady_r_pct` | 5 | 1–100 | R% de ruído de medição durante estado estacionário |
 | `kcc_kf_q_shift` | 20 | 0–30 | Deslocamento de ruído de processo (Q = 1 << shift) |
 | `kcc_kf_chi2_num` | 384 | 1–100000 | Numerador do portão de outliers qui-quadrado |
 | `kcc_kf_chi2_den` | 100 | 1–100000 | Denominador do portão de outliers qui-quadrado |
+
+Quando `kcc_kf_steady_mode` está ativado (1), a largura de banda inicial para novas conexões usa o pico monotônico da estimativa KF (kf_x_steady) em vez da estimativa ao vivo, que pode ter diminuído desde a última conexão de alto rendimento. Isso evita a escassez de inicialização a frio em caminhos estáveis. O pico é zerado ao desabilitar o modo, permitindo uma reinicialização limpa na reativação.
 
 ### Desempenho no Primeiro Segundo (Transpacífico, 212 ms RTT)
 

@@ -309,7 +309,6 @@ Le variazioni di velocità vengono applicate immediatamente (nessun livellamento
 
 ```
 target = BDP(bw, gain, ext)                       // BDP base
-// limiti traffico in volo (non-STARTUP: clamp lo~hi; STARTUP: solo pavimento lo)
 target = quantization_budget(target)              // margine TSO + round pari + bonus fase-0
 target += ack_agg_bonus + agg_compensation        // compensazione aggregazione ACK
 
@@ -343,8 +342,6 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | Moltiplicatore bonus aggregazione ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | Guadagno STARTUP (≈2,885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | Guadagno DRAIN (≈0,347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Limite inferiore traffico in volo (1,0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Limite superiore traffico in volo (2,0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | Pattern BBRv1 (256 slot) | 0/1 | — | Guadagno pacing per slot |
 | `kcc_cycle_decay_mask[8]` | 0 (tutti zero) | 0 | 0x7FFFFFFF | Bitmap decadimento a 256 bit |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Uscita limitata probe-up (0=spento) |
@@ -528,7 +525,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              immediato, regola BBR
     │
-    └──► kcc_set_cwnd()                    BDP + limiti + compensazione agg
+    └──► kcc_set_cwnd()                    BDP + compensazione agg
 ```
 
 ## Flusso Interno del Filtro di Kalman
@@ -671,7 +668,7 @@ dove `high_gain ≈ 2.89` è il moltiplicatore di pacing BBR STARTUP.
 Abilitazione tramite `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
 ```
 
@@ -679,14 +676,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | Parametro | Predefinito | Intervallo | Descrizione |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Abilitazione principale per l'iniezione globale Kalman BDP |
+| \`kcc_kf_enable\` | 1 | 0–1 | Abilitazione principale per l'iniezione globale Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numeratore della velocità dessert (% della BP in quota equa) |
-| `kcc_kf_discount_den` | 100 | 1–100000 | Denominatore della velocità dessert |
-| `kcc_kf_startup_r_pct` | 20 | 1–100 | Rumore di misura R% durante la fase di avvio |
-| `kcc_kf_steady_r_pct` | 5 | 1–100 | Rumore di misura R% durante il regime stazionario |
-| `kcc_kf_q_shift` | 20 | 0–30 | Shift del rumore di processo (Q = 1 << shift) |
-| `kcc_kf_chi2_num` | 384 | 1–100000 | Numeratore della soglia outlier chi quadrato |
-| `kcc_kf_chi2_den` | 100 | 1–100000 | Denominatore della soglia outlier chi quadrato |
+| \`kcc_kf_discount_den\` | 100 | 1–100000 | Denominatore della velocità dessert |
+| \`kcc_kf_steady_mode\` | 0 | 0/1 | — | Modalità stazionaria: se attiva, usa il picco monotono (kf_x_steady) per init_bw, ignorando i cali transitori del KF |
+| \`kcc_kf_startup_r_pct\` | 20 | 1–100 | Rumore di misura R% durante la fase di avvio |
+| \`kcc_kf_steady_r_pct\` | 5 | 1–100 | Rumore di misura R% durante il regime stazionario |
+| \`kcc_kf_q_shift\` | 20 | 0–30 | Shift del rumore di processo (Q = 1 << shift) |
+| \`kcc_kf_chi2_num\` | 384 | 1–100000 | Numeratore della soglia outlier chi quadrato |
+| \`kcc_kf_chi2_den\` | 100 | 1–100000 | Denominatore della soglia outlier chi quadrato |
+
+Quando kcc_kf_steady_mode è abilitato (1), la larghezza di banda iniziale per le nuove connessioni utilizza il picco monotono della stima KF (kf_x_steady) anziché la stima in tempo reale, che potrebbe essere diminuita dall'ultima connessione ad alta velocità. Ciò previene la fame di avvio a freddo su percorsi stabili. Il picco viene azzerato quando la modalità viene disabilitata, consentendo una ripartenza pulita alla riattivazione.
 
 ### Prestazioni al Primo Secondo (Trans-Pacifico, 212 ms RTT)
 

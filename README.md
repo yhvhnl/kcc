@@ -305,7 +305,6 @@ Rate changes are applied immediately (no smoothing), matching BBR (Cardwell et a
 
 ```
 target = BDP(bw, gain, ext)                       // base BDP
-// inflight bounds (non-STARTUP: lo~hi clamp; STARTUP: lo floor only)
 target = quantization_budget(target)              // TSO headroom + even-round + phase-0 bonus
 target += ack_agg_bonus + agg_compensation        // ACK aggregation compensation
 
@@ -339,8 +338,6 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK aggregation bonus multiplier |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP gain (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN gain (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Inflight lower bound (1.0x BDP) |
-| `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Inflight upper bound (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 pattern (256 slots) | 0/1 | — | Per-slot pacing gain |
 | `kcc_cycle_decay_mask[8]` | 0 (all zero) | 0 | 0x7FFFFFFF | 256-bit decay bitmap |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Limit PROBE_BW up-phase exit (0=off) |
@@ -531,7 +528,7 @@ kcc_main()
     │
     ├──► kcc_set_pacing_rate()              immediate, BBR rule
     │
-    └──► kcc_set_cwnd()                    BDP + bounds + agg compensation
+    └──► kcc_set_cwnd()                    BDP + agg compensation
 ```
 
 ## Kalman Filter Internal Flow
@@ -676,7 +673,7 @@ where `high_gain ≈ 2.89` is the BBR STARTUP pacing multiplier.
 Enable via `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 0)
+sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 0–100, recommended 35–75)
 ```
 
@@ -684,14 +681,17 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 0 | 0–1 | Master enable for global Kalman BDP injection |
+| `kcc_kf_enable` | 1 | 0–1 | Master enable for global Kalman BDP injection |
 | `kcc_kf_discount_num` | 50 | 0–100 | Dessert-speed numerator (% of fair-share BW) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-speed denominator |
+| `kcc_kf_steady_mode` | 0 | 0/1 | — | Steady-mode: use monotonic peak (kf_x_steady) for init_bw when enabled, ignoring transient KF dips |
 | `kcc_kf_startup_r_pct` | 20 | 1–100 | Measurement noise R% during startup phase |
 | `kcc_kf_steady_r_pct` | 5 | 1–100 | Measurement noise R% during steady-state |
 | `kcc_kf_q_shift` | 20 | 0–30 | Process noise shift (Q = 1 << shift) |
 | `kcc_kf_chi2_num` | 384 | 1–100000 | Chi-squared outlier gate numerator |
 | `kcc_kf_chi2_den` | 100 | 1–100000 | Chi-squared outlier gate denominator |
+
+When kcc_kf_steady_mode is enabled (1), the init_bw for new connections uses the monotonically rising peak of the KF estimate (kf_x_steady) instead of the live estimate, which may have drifted downward since the last high-throughput connection. This prevents cold-start starvation on stable paths. The peak is reset to zero when the mode is disabled, giving a clean slate on re-enable.
 
 ### First-Second Performance (Trans-Pacific, 212 ms RTT)
 
