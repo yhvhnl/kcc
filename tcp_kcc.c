@@ -265,6 +265,28 @@
 #define kcc_random_below(x) prandom_u32_max(x)      /* uniform random [0, x); pre-6.2 API uses pseudo-random with bounded range; functionally identical for our use (PROBE_BW cycle phase randomization) */
 #endif
     /*
+     * Kernel 6.11 added const to proc_handler's ctl_table argument:
+     *
+     *   include/linux/sysctl.h:
+     *     <  6.11: typedef int proc_handler(struct ctl_table *ctl, ...);
+     *     >= 6.11: typedef int proc_handler(const struct ctl_table *ctl, ...);
+     *
+     *   The treewide change constified every proc_handler callback and
+     *   kernel-internal consumer (proc_dointvec etc.).  Without the
+     *   const qualifier our function signatures won't match the type
+     *   stored in struct ctl_table's .proc_handler member, causing a
+     *   compile error on 6.11+.
+     *
+     *   proc_dointvec() (called in the body) also gained const in the
+     *   same series; since we pass our ctl through the macro, the call
+     *   site matches the kernel's declaration in both directions.
+     */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#define KCC_CTL_TABLE const struct ctl_table
+#else
+#define KCC_CTL_TABLE struct ctl_table
+#endif
+    /*
      * tcp_snd_cwnd_set() / tcp_snd_cwnd() were introduced in kernel 5.14.
      * Provide inline fallbacks for older kernels so KCC compiles against
      * pre-5.14 kernels without modification.
@@ -1294,10 +1316,11 @@ module_param_cb(kcc_minrtt_fast_fall_div, &kcc_param_ops, &kcc_minrtt_fast_fall_
 /* ---- BDP calculation bounds (us, int) -------------------------------- */
 /*
  * kcc_bdp_min_rtt_us — Floor for min_rtt_us in BDP calculation.
- * If model_rtt < this (and Kalman not yet converged), BDP returns
- * TCP_INIT_CWND.  Default 1 us (effectively disabled; matches BBR behavior).
+ * If model_rtt < this (and Kalman not yet converged), model_rtt is
+ * floored to this value rather than using an unrealistically small
+ * RTT.  Default 1 us (effectively disabled; matches BBR behaviour).
  */
-static int kcc_bdp_min_rtt_us = 1;                   /* BDP min-RTT floor (us): if min_rtt_us < this (and Kalman not converged), kcc_bdp() returns TCP_INIT_CWND; KCC extension to prevent BDP collapse on sub-millisecond paths; kernel BBR has no explicit min-RTT floor; range [0, 100000], BBR default: effectively 0 (no floor) */
+static int kcc_bdp_min_rtt_us = 1;                   /* BDP min-RTT floor (us): if model_rtt < this (and Kalman not converged), model_rtt is floored to this minimum; prevents BDP inflation on sub-millisecond paths; range [0, 100000], BBR default: N/A (no explicit floor) */
 module_param_cb(kcc_bdp_min_rtt_us, &kcc_param_ops, &kcc_bdp_min_rtt_us, 0644); /* sysctl: kcc_bdp_min_rtt_us */
 
 /* ---- TSO/quantization (int) ------------------------------------------ */
@@ -2026,7 +2049,7 @@ static inline bool kcc_cycle_decay_enabled(u32 idx)         /* check if decay bi
  * kcc_rebuild_gain_table() after any successful write to refresh the
  * kcc_cycle_gain_table[] cache.
  */
-static int kcc_gain_proc_handler(struct ctl_table* ctl, int write, /* custom sysctl handler for gain arrays */
+static int kcc_gain_proc_handler(KCC_CTL_TABLE* ctl, int write, /* custom sysctl handler for gain arrays; KCC_CTL_TABLE adapts const for 6.11+ */
     void* buffer, size_t* lenp, loff_t* ppos)         /* standard sysctl callback signature */
 {
     int ret = proc_dointvec(ctl, write, buffer, lenp, ppos);       /* delegate array read/write to kernel */
@@ -3337,7 +3360,9 @@ static u32 kcc_get_model_rtt(const struct sock* sk,                            /
  *   bdp_raw = (w * gain) >> BBR_SCALE
  *   bdp_seg = ceil(bdp_raw / BW_UNIT) = (bdp_raw + BW_UNIT - 1) >> BW_SCALE
  *
- * Returns TCP_INIT_CWND (approx 10) if min_rtt_us is invalid or below floor.
+ * Returns TCP_INIT_CWND (approx 10) if min_rtt_us == KCC_MIN_RTT_UNINIT.
+ * Otherwise floors model_rtt to kcc_bdp_min_rtt_us_val when below the
+ * configured minimum and the Kalman filter has not yet converged.
  *
  * Corresponds to kernel BBR v5.4: bbr_bdp().
  * Identical formula and fixed-point scaling (BW_SCALE, BBR_SCALE, BW_UNIT).
@@ -7317,18 +7342,22 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
      * min_rtt_us == 0 cascades as follows:
      *
      *   kcc_bdp(): KCC_MIN_RTT_UNINIT is U32_MAX, not 0 → the guard at
-     *     line 3386 does NOT catch min_rtt_us == 0.  The BDP floor
-     *     (kcc_bdp_min_rtt_us_val, default 1us) inflates model_rtt,
+     *     ~3408 does NOT catch min_rtt_us == 0.  The BDP floor
+     *     (kcc_bdp_min_rtt_us_val, default 1 us) inflates model_rtt,
      *     producing a grossly inflated BDP that starves cwnd.
-     *   kcc_update_min_rtt(): the sticky/srtt-guard logic (line 5973)
-     *     requires min_rtt_us to be truthy → skipped, no secondary rescue.
-     *   Kalman cold-start ceiling (line 5281): ceiling = 0, but x_est is
-     *     also 0 at init → no action; harmless in practice.
+     *   kcc_update_min_rtt(): the SRTT guard (~5995 tests
+     *     kcc->min_rtt_us as a boolean) and sticky-ratio logic both skip
+     *     — no secondary rescue from normal RTT samples.
+     *   Kalman cold-start ceiling (~5300): if min_rtt_us == 0 the
+     *     x_est ≤ ceiling check would zero a non-zero x_est (ceiling =
+     *     0 << shift = 0, but x_est was seeded from the first
+     *     measurement) — actively destructive rather than harmless.
      *
-     * The connection crawls until the PROBE_RTT filter expires (~10s
-     * default) and sets min_rtt_us = rtt_clamped at line 5951.  The cost
-     * of the unconditional fallback is one srtt_us read + one right shift
-     * at init — cheaper than the worst-case penalty of a 10s stall. */
+     * The connection crawls until the PROBE_RTT filter expires (~10 s
+     * default) and forces min_rtt_us = rtt_clamped at the "normal
+     * update" path (~5973).  The cost of the unconditional fallback is
+     * one srtt_us read + one right shift at init — cheaper than the
+     * worst-case penalty of a 10 s stall. */
     if (kcc->min_rtt_us == 0) {
         struct tcp_sock* tp = tcp_sk(sk);
         kcc->min_rtt_us = tp->srtt_us ? tp->srtt_us >> 3 : USEC_PER_MSEC;
@@ -7573,7 +7602,7 @@ static struct ctl_table_header* kcc_ctl_header;                                 
  * After a successful write, triggers kcc_init_module_params() to
  * recompute clamped/derived values.
  */
-static int kcc_proc_handler(struct ctl_table* ctl, int write,                                          /* sysctl per-entry handler */
+static int kcc_proc_handler(KCC_CTL_TABLE* ctl, int write,                                          /* sysctl per-entry handler; KCC_CTL_TABLE adapts const for 6.11+ */
     void* buffer, size_t* lenp, loff_t* ppos)                                               /* standard sysctl signature */
 {
     int ret = proc_dointvec(ctl, write, buffer, lenp, ppos);                                             /* delegate to kernel handler */
@@ -7868,8 +7897,22 @@ static int __init kcc_register(void)                                            
     }
     kcc_init_module_params();                                                                                                      /* clamp + compute all derived values */
 
-    /* Register sysctl at /proc/sys/net/kcc/ */
-    kcc_ctl_header = register_sysctl("net/kcc", kcc_ctl_table);                                                                     /* register sysctl table */
+    /*
+     * Register sysctl at /proc/sys/net/kcc/.
+     *
+     * register_sysctl_sz() was introduced in v6.6 with bounded
+     * iteration over a known table size.  6.12 hardened validation
+     * rejects entries where procname == NULL (the {} sentinel), so
+     * the sentinel must be excluded: -1.  Pre-6.6 uses the legacy
+     * register_sysctl() which iterates via the sentinel itself and
+     * naturally stops at the first NULL procname.
+     */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+    kcc_ctl_header = register_sysctl_sz("net/kcc", kcc_ctl_table,
+        ARRAY_SIZE(kcc_ctl_table) - 1);                                         /* -1: exclude {} sentinel */
+#else
+    kcc_ctl_header = register_sysctl("net/kcc", kcc_ctl_table);                 /* pre-6.6: sentinel-based */
+#endif
     if (!kcc_ctl_header) {
         pr_warn("KCC: failed to register sysctl\n");
         goto unregister_sysctl;
