@@ -671,7 +671,7 @@ coeff = (discount_ratio) / high_gain
 `sysctl`을 통해 활성화:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # 마스터 활성화 (기본값 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # 마스터 활성화 (기본값 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # 디저트 속도 분자 (기본값 50, 범위 35–75)
 ```
 
@@ -679,7 +679,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # 디저트 속도 분자 (기본값 
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 1 | 0–1 | 글로벌 칼만 BDP 주입 마스터 활성화 |
+| `kcc_kf_enable` | 0 | 0–1 | 글로벌 칼만 BDP 주입 마스터 활성화 |
 | `kcc_kf_discount_num` | 50 | 0–100 | 디저트 속도 분자 (공정 점유 대역폭의 %) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | 디저트 속도 분모 |
 | `kcc_kf_steady_mode` | 0 | 0/1 | — | 정상 모드: 활성화 시 KF의 일시적 하락을 무시하고 단조 증가 피크(kf_x_steady)를 초기 대역폭으로 사용 |

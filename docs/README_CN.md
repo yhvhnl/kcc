@@ -666,7 +666,7 @@ coeff = (discount_ratio) / high_gain
 通过 `sysctl` 启用：
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # master enable (default 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
 ```
 
@@ -674,7 +674,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | 参数 | 默认值 | 范围 | 说明 |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 1 | 0–1 | 全局卡尔曼 BDP 注入主开关 |
+| `kcc_kf_enable` | 0 | 0–1 | 全局卡尔曼 BDP 注入主开关 |
 | `kcc_kf_discount_num` | 50 | 0–100 | 甜点速度分子（公平份额带宽百分比） |
 | `kcc_kf_discount_den` | 100 | 1–100000 | 甜点速度分母 |
 | `kcc_kf_steady_mode` | 0 | 0/1 | — | 稳态模式：启用时使用单调峰值（kf_x_steady）作为初始带宽，忽略 KF 的瞬时下沉 |

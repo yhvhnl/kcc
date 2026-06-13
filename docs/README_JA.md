@@ -673,7 +673,7 @@ coeff = (discount_ratio) / high_gain
 `sysctl` で有効化：
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # master enable (default 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 35–75)
 ```
 
@@ -681,7 +681,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | パラメータ | デフォルト | 範囲 | 説明 |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 1 | 0–1 | グローバルカルマン BDP 注入のマスター有効化 |
+| `kcc_kf_enable` | 0 | 0–1 | グローバルカルマン BDP 注入のマスター有効化 |
 | `kcc_kf_discount_num` | 50 | 0–100 | デザートスピード分子（公平シェア BW に対する %） |
 | `kcc_kf_discount_den` | 100 | 1–100000 | デザートスピード分母 |
 | `kcc_kf_steady_mode` | 0 | 0/1 | — | ステディモード：有効時、KF の瞬間的な低下を無視し、単調増加ピーク（kf_x_steady）を初期帯域幅に使用 |

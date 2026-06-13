@@ -673,7 +673,7 @@ onde `high_gain ≈ 2.89` é o multiplicador de pacing do STARTUP do BBR.
 Habilitar via `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # habilitação mestre (padrão 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # habilitação mestre (padrão 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador da velocidade de sobremesa (padrão 50, faixa 35–75)
 ```
 
@@ -681,7 +681,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador da velocidade de sobremes
 
 | Parâmetro | Padrão | Faixa | Descrição |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 1 | 0–1 | Habilitação mestre para injeção global Kalman BDP |
+| `kcc_kf_enable` | 0 | 0–1 | Habilitação mestre para injeção global Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numerador da velocidade de sobremesa (% do BW de divisão justa) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | Denominador da velocidade de sobremesa |
 | `kcc_kf_steady_mode` | 0 | 0/1 | — | Modo estável: ativado, usa o pico monotônico (kf_x_steady) para init_bw, ignorando quedas transitórias do KF |

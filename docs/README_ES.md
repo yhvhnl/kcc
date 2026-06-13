@@ -668,7 +668,7 @@ donde `high_gain ≈ 2.89` es el multiplicador de pacing de STARTUP de BBR.
 Habilitar mediante `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # habilitación maestra (predeterminado 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # habilitación maestra (predeterminado 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador de velocidad de postre (predet. 50, rango 35–75)
 ```
 
@@ -676,7 +676,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # numerador de velocidad de postre (p
 
 | Parámetro | Predet. | Rango | Descripción |
 |-----------|---------|-------|-------------|
-| \`kcc_kf_enable\` | 1 | 0–1 | Habilitación maestra para inyección global Kalman BDP |
+| `kcc_kf_enable` | 0 | 0–1 | Habilitación maestra para inyección global Kalman BDP |
 | `kcc_kf_discount_num` | 50 | 0–100 | Numerador de velocidad de postre (% del BW de participación justa) |
 | \`kcc_kf_discount_den\` | 100 | 1–100000 | Denominador de velocidad de postre |
 | \`kcc_kf_steady_mode\` | 0 | 0/1 | — | Modo estable: al activarse, usa el pico monótono (kf_x_steady) para init_bw, ignorando caídas transitorias del KF |

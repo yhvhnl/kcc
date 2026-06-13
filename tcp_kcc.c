@@ -1126,13 +1126,13 @@ module_param_cb(kcc_kalman_min_samples, &kcc_param_ops, &kcc_kalman_min_samples,
 /* ---- Global Kalman BDP filter (cross-connection bandwidth estimation) ---- */
 /*
  * kcc_kf_enable — Master enable switch for the cross-connection
- *     Global Kalman BDP filter.  When 1 (default), all connections
- *     share a single KF estimate of the bottleneck fair-share bandwidth,
+ *     Global Kalman BDP filter.  When 1, all connections share a
+ *     single KF estimate of the bottleneck fair-share bandwidth,
  *     enabling dessert-speed cold-start injection and multi-flow BDP
- *     coordination.  When 0, each connection uses only its own per-ACK
- *     bandwidth samples for BDP calculation.  Default 1 (on).
+ *     coordination.  When 0 (default), each connection uses only its
+ *     own per-ACK bandwidth samples for BDP calculation.  Default 0 (off).
  */
-static int kcc_kf_enable = 1;                         /* master enable switch for cross-connection Global Kalman BDP filter (0=off, 1=on); KCC-only: kernel BBR has no cross-connection bandwidth sharing; when enabled, the global KF estimate overrides per-connection BDP for fair-share bandwidth allocation across all connections sharing a bottleneck; range [0, 1], BBR default: N/A (no cross-connection KF) */
+static int kcc_kf_enable = 0;                         /* master enable switch for cross-connection Global Kalman BDP filter (0=off, 1=on); KCC-only: kernel BBR has no cross-connection bandwidth sharing; when enabled, the global KF estimate overrides per-connection BDP for fair-share bandwidth allocation across all connections sharing a bottleneck; range [0, 1], BBR default: N/A (no cross-connection KF) */
 module_param_cb(kcc_kf_enable, &kcc_param_ops, &kcc_kf_enable, 0644); /* sysctl: kcc_kf_enable */
 /*
  * kcc_kf_startup_r_pct — Measurement noise R as percentage of the
@@ -7304,9 +7304,32 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
      * bbr->min_rtt_us = tcp_min_rtt(tp).  Without this, kcc_bdp() returns
      * TCP_INIT_CWND (~10) until the first RTT sample arrives, starving cwnd. */
     kcc->min_rtt_us = tcp_min_rtt(tcp_sk(sk));
-    /* KCC: dessert-speed fast startup — SRTT fallback only when global KF
-     * (cross-connection bandwidth sharing) is active.  Otherwise match BBR. */
-    if (kcc->min_rtt_us == 0 && kcc_kf_enable_val) {
+    /* SRTT fallback: if the 3WHS didn't produce an RTT sample, bootstrap
+     * min_rtt_us from SRTT (or fall back to 1ms).
+     *
+     * The fallback was originally gated on kcc_kf_enable_val — it existed
+     * to give KF-injected init_bw a companion RTT for BDP cwnd seeding.
+     * When KF is disabled (default), tcp_min_rtt() almost always yields a
+     * valid 3WHS sample and this fallback is never needed in normal operation.
+     *
+     * However, removing the guard outright is deliberate: if tcp_min_rtt()
+     * ever returns 0 in the rare case (no 3WHS RTT measurement), a stuck
+     * min_rtt_us == 0 cascades as follows:
+     *
+     *   kcc_bdp(): KCC_MIN_RTT_UNINIT is U32_MAX, not 0 → the guard at
+     *     line 3386 does NOT catch min_rtt_us == 0.  The BDP floor
+     *     (kcc_bdp_min_rtt_us_val, default 1us) inflates model_rtt,
+     *     producing a grossly inflated BDP that starves cwnd.
+     *   kcc_update_min_rtt(): the sticky/srtt-guard logic (line 5973)
+     *     requires min_rtt_us to be truthy → skipped, no secondary rescue.
+     *   Kalman cold-start ceiling (line 5281): ceiling = 0, but x_est is
+     *     also 0 at init → no action; harmless in practice.
+     *
+     * The connection crawls until the PROBE_RTT filter expires (~10s
+     * default) and sets min_rtt_us = rtt_clamped at line 5951.  The cost
+     * of the unconditional fallback is one srtt_us read + one right shift
+     * at init — cheaper than the worst-case penalty of a 10s stall. */
+    if (kcc->min_rtt_us == 0) {
         struct tcp_sock* tp = tcp_sk(sk);
         kcc->min_rtt_us = tp->srtt_us ? tp->srtt_us >> 3 : USEC_PER_MSEC;
     }
@@ -7333,8 +7356,9 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
              * BDP function with neutral gain for a conservative initial
              * window that doesn't overshoot the bottleneck. */
             {
+                u32 lo = max_t(u32, tp->snd_cwnd, TCP_INIT_CWND);       /* respect kernel's existing cwnd as floor */
                 u32 init_cwnd = kcc_bdp(sk, (u32)init_bw, BBR_UNIT, NULL);     /* BDP at neutral gain */
-                init_cwnd = clamp_t(u32, init_cwnd, TCP_INIT_CWND, KCC_KF_CWND_SEGS_MAX); /* clamp to valid range */
+                init_cwnd = clamp_t(u32, init_cwnd, lo, KCC_KF_CWND_SEGS_MAX); /* clamp: max(lo, min(init_cwnd, MAX)) */
                 tp->snd_cwnd = init_cwnd;                                /* seed cwnd with KF-guided BDP */
             }
             kcc->has_seen_rtt = 1;                                              /* mark: bandwidth seen (prevents RTT bootstrap) */
@@ -7737,7 +7761,7 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_tso_segs_default",      .data = &kcc_tso_segs_default,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] TSO segments at normal pacing rate; BBR default: 2 */
     {.procname = "kcc_extra_acked_win_rtts_max", .data = &kcc_extra_acked_win_rtts_max, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535 RTTs] max dual-window RTTs before rotation; KCC-only; default 31 */
     /* Global Kalman BDP filter (cross-connection bandwidth estimation) */
-    {.procname = "kcc_kf_enable",              .data = &kcc_kf_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] global Kalman BDP enable; KCC-only; default 1=on */
+    {.procname = "kcc_kf_enable",              .data = &kcc_kf_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] global Kalman BDP enable; KCC-only; default 0=off */
     {.procname = "kcc_kf_startup_r_pct",       .data = &kcc_kf_startup_r_pct,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100%] startup R measurement noise pct; KCC-only; default 20 */
     {.procname = "kcc_kf_steady_r_pct",        .data = &kcc_kf_steady_r_pct,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100%] steady-state R measurement noise pct; KCC-only; default 5 */
     {.procname = "kcc_kf_q_shift",             .data = &kcc_kf_q_shift,             .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..30] process noise shift (Q = 1<<shift); KCC-only; default 20 */

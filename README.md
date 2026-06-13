@@ -673,7 +673,7 @@ where `high_gain ≈ 2.89` is the BBR STARTUP pacing multiplier.
 Enable via `sysctl`:
 
 ```bash
-sysctl -w net.kcc.kcc_kf_enable=1           # master enable (default 1)
+sysctl -w net.kcc.kcc_kf_enable=0           # master enable (default 0)
 sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50, range 0–100, recommended 35–75)
 ```
 
@@ -681,7 +681,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kf_enable` | 1 | 0–1 | Master enable for global Kalman BDP injection |
+| `kcc_kf_enable` | 0 | 0–1 | Master enable for global Kalman BDP injection |
 | `kcc_kf_discount_num` | 50 | 0–100 | Dessert-speed numerator (% of fair-share BW) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-speed denominator |
 | `kcc_kf_steady_mode` | 0 | 0/1 | — | Steady-mode: use monotonic peak (kf_x_steady) for init_bw when enabled, ignoring transient KF dips |
