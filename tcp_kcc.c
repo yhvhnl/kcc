@@ -4580,6 +4580,13 @@
  * NOT by Kalman's own MMSE optimality.  The proofs are structural justification
  * for the design, not a claim of strict optimality of every ACK's processing.
  *
+ * NOTE ON NEGATIVE-INNOVATION DAMPENING: Negative innovations are dampened by
+ * KCC_NEG_INNOV_DAMPEN_SHIFT=2 (K_eff = K/4).  This introduces an effective
+ * Kalman gain beta*K with beta=1/4.  The ISS small-gain condition gamma_loop =
+ * beta*K_ss = 0.25*0.39 = 0.0975 < 1 still holds.  Stability is preserved;
+ * downward convergence rate is reduced by factor 1/beta=4.  See B29 in README
+ * for the full ISS-update derivation.
+ *
  * PROOF HIERARCHY SUMMARY:
  *
  *   Component Level:  Proof A (completeness), B (T_noise), C (directional),
@@ -4907,19 +4914,13 @@
  *     max(128 RTTs, 30s).
  *
  *   B20. Packet Reordering (Non-Congestion).
- *     Reordering can produce false RTT drops — out-of-order ACKs carry
- *     earlier timestamps -> spurious RTT values below current x_est ->
- *     directional gate INCORRECTLY accepts them as clean T_prop samples.
- *     Bounded impact proof: (i) jitter EWMA outlier gate (multiplier 5x,
- *     Chebyshev P <= 4%) rejects reordering-induced RTT drops exceeding
- *     5*sigma below the current estimate.  (ii) min_rtt_us sliding window
- *     provides a physical floor — x_est cannot drop below the 10s minimum
- *     observed RTT.  (iii) Reordering-induced errors are transient: on
- *     subsequent correct ACKs, RTT returns to normal producing positive
- *     innovations (rejected) or returns above x_est producing negative
- *     innovations (accepted, but bounded by the outlier gate).  Net effect:
- *     bounded over-estimate of at most the jitter threshold (<=5ms),
- *     converging within 5 RTTs.
+ *     (a) Late delivery -> RTT increase: rejected by directional gate.
+ *     (b) Early ACK -> RTT decrease: negative innovation passes directional
+ *     gate.  Defense: negative innovations are dampened by
+ *     KCC_NEG_INNOV_DAMPEN_SHIFT (corr>>2 = corr/4).  A single reordering
+ *     event causes only 1/4 displacement; ~4 clean samples needed for same
+ *     correction magnitude.  Q-boost (path change) not dampened.
+ *     See B29 for the acknowledged structural limitation.
  *
  *   B21. Delayed ACK (40ms Linux Default).
  *     Systematic +0-40ms bias on all RTT samples.  At 100ms RTT: max
@@ -4992,23 +4993,19 @@
  *   == Critical Missing Boundary Cases (B29-B35) ==
  *   (Adapted from KCC_Rebuttal.md §5.10)
  *
- *   B29. Packet Reordering -> False RTT Spikes (Congestion Mimicry).
- *     Physical model: Reordering when packets take different paths (ECMP,
- *     LAG hashing).  A packet sent earlier (timestamp t_send) that arrives
- *     later produces z_k = t_now - t_send^(early) > true RTT.  This is a
- *     positive innovation structurally indistinguishable from queue-induced
- *     RTT increase.  CRITICAL: reordering is SAFELY handled by directional
- *     conservatism — ALL positive innovations rejected regardless of cause.
- *     Proof of safety: Let reordering events occur at rate p_reorder per
- *     RTT.  Information loss ratio = p_reorder / (p_clean + p_reorder).
- *     For p_reorder <= 0.01 (1%) and p_clean >= 0.3: loss <= 3.2%.
- *     Theorem (reordering robustness): (1) Reordering -> RTT increase:
- *     rejected as positive innovation -> zero impact on x_est.
- *     (2) Reordering -> RTT decrease: bounded by outlier gate and min_rtt
- *     floor.  (3) Net effect: x_est <= true T_prop + max(jitter_thresh,
- *     reordering_bias).  This is a structural advantage over symmetric
- *     estimators (standard Kalman, BBR's windowed min/max) that would
- *     track reordering artifacts.
+ *   B29. Packet Reordering — False RTT Increase (Handled) and Decrease (Residual Risk).
+ *     Two distinct cases: (a) Late delivery -> RTT increase: safely rejected by
+ *     directional gate.  (b) Early ACK -> RTT DECREASE: an out-of-order ACK
+ *     carries an earlier send timestamp, producing a negative innovation that
+ *     PASSES the directional gate, pulling x_est downward.  No single-sample
+ *     RTT-only heuristic can reliably distinguish this from a genuine path
+ *     improvement — any fixed threshold either rejects valid latency reductions
+ *     or permits reordering through.  Defense: the min_rtt sticky window (multiple
+ *     samples required to commit a new minimum) provides eventual correction.
+ *     Acknowledged limitation: transient x_est underestimation is possible after
+ *     reordering events.  Cross-layer signals (DSACK, TCP timestamp consistency)
+ *     would be needed for a definitive single-sample defense, but these are not
+ *     available through the rate_sample interface.
  *
  *   B30. ACK Compression/Thinning (Aggressive Coalescing).
  *     Physical model: Some receivers coalesce 4-8 ACKs into a single ACK.
@@ -5976,6 +5973,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_DRIFT_TIER2_SHIFT        3      /* [T_noise] Tier-2 correction divisor: corr>>3=corr/8 */
 #define KCC_POS_SKIP_SATURATION      254    /* [T_noise] pos_skip_cnt ceiling; derivation: pos_skip_cnt is u8 (max 255); Tier-2 drift threshold = drift_thresh * 8 = 16 * 8 = 128; saturation at 254 (not 255) provides a 2-value safety margin below u8 max, preventing arithmetic wrap-around from triggering a false Q-boost suppression release; 254 > 128 ensures Tier-2 activation is always reachable; the gap 254-128 = 126 gives 126 RTTs of post-Tier-2 counting headroom before saturation */
 #define KCC_P_EST_SAT_POS_SKIP_THRESH 64     /* [K] pos_skip_cnt threshold for p_est-saturation response; derivation: this check fires BEFORE Tier-2 drift correction in the positive-innovation branch; Tier-2 at drift_thresh*8=128 resets pos_skip_cnt to 0, so saturation MUST use a lower threshold to avoid perpetual preemption; 64 = drift_thresh*4 = 16*4 gives P = 2^(-64) ≅ 5.4×10⁻²⁰ (Neyman-Pearson), still overwhelmingly rejecting H_0; invariant enforced at clamp: saturation_thresh < drift_thresh * KCC_DRIFT_TIER2_MULT */
+#define KCC_NEG_INNOV_DAMPEN_SHIFT    2      /* [T_prop] Negative-innovation dampening: corr>>2 = K*|innov|/4.  Single RTT samples are not individually trustworthy — reordering, ACK compression, and transient noise can produce false negative innovations.  Dampening converts the 'instant single-sample trust' of the directional gate into a multi-sample filter: ~4 clean samples are required for the same magnitude of downward correction.  Genuine path improvements (which persist) still converge fully; single-sample artifacts (reordering) cause only 1/4 of the damage.  Q-boost (forced path-change update) is NOT dampened — it passes at full gain. */
 
      /* PARAMETER DERIVATION: KCC_TSO_DIV_FLOOR / CEIL / HALVE_SHIFT / DOUBLE_SHIFT
       *
@@ -6241,6 +6239,7 @@ struct kcc_ext {
     u8  qboost_cdwn;                                 /* [K] cooldown counter: min accepted samples between qboost events; prevents runaway resets */
 
     u8  pos_skip_cnt;                                /* [T_noise] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
+    u8  neg_innov_cnt;                               /* [T_prop] consecutive dampened negative innovations; drifts up to (1<<DAMPEN_SHIFT)-1 before resetting pos_skip_cnt; prevents single reordering events from interrupting drift counters */
     u8  alone_exit_cnt;                              /* [T_noise] consecutive alone_eval failures; exit hysteresis for multi-flow resonance resistance */
 
     struct list_head kcc_node;                                              /* [K] list node in module-global kcc_conn_list for /proc/kcc/status */
@@ -11516,6 +11515,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         u64 corr_abs = 0;                                                                                                      /* [T_prop] correction magnitude (hoisted for covariance matching) */
         bool qboost_fired = false;                                                                                                  /* Q-boost flag: skip outlier gate */
         bool saturation_fired = false;                                                                                               /* [K] p_est-saturation flag: skip drift tiers and force p_est init */
+        bool neg_innov_dampened = false;                                                                                          /* [T_prop] negative-innovation dampening applied: scale covariance reduction to match */
 
         /* THREE-COMPONENT MODEL: Q-Boost (T_prop path-change detection).
          *
@@ -11722,8 +11722,19 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
             if (innovation < 0 || qboost_fired) {
                 /* [T_prop] Downward update (clean sample: negative innovation enters filter)
                  * OR Q-boost (path change: positive innovation enters filter):
-                 * apply correction in the direction of the innovation. */
-                correction = (innovation >= 0) ? (s64)min_t(u64, corr_abs, KCC_S64_MAX) : -(s64)min_t(u64, corr_abs, KCC_S64_MAX);                                     /* sign follows innovation (saturate to avoid -(s64)U64_MAX UB) */
+                 * apply correction in the direction of the innovation.
+                 *
+                 * [T_prop] Negative innovations are dampened by KCC_NEG_INNOV_DAMPEN_SHIFT
+                 * to convert the fragile single-sample trust into a multi-sample filter.
+                 * Reordering, ACK compression, and transient noise can produce false
+                 * negative innovations — a single sample should not significantly move
+                 * the long-running x_est baseline.  Q-boost (forced path-change update)
+                 * is NOT dampened — it passes at full Kalman gain. */
+                correction = (innovation >= 0) ? (s64)min_t(u64, corr_abs, KCC_S64_MAX) : -(s64)min_t(u64, corr_abs, KCC_S64_MAX);
+                if (innovation < 0) {
+                    correction >>= KCC_NEG_INNOV_DAMPEN_SHIFT;                      /* dampen single-sample downward updates */
+                    neg_innov_dampened = true;                                        /* scale covariance reduction to match */
+                }
 
                 {
                     s64 new_x = (s64)ext->x_est + correction;                                                                     /* [T_prop] new x_est = old x_est + K*innovation; clamped to U32_MAX */
@@ -11737,9 +11748,23 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                     }
                 }
 
-                /* [K] Accepted update -- reset directional-skip counter, mark state as modified */
+                /* [K] Dampened negative innovation: to prevent single reordering events
+                 * from resetting the drift counter (pos_skip_cnt), count consecutive
+                 * dampened negatives.  Only when neg_innov_cnt reaches the dampening
+                 * threshold (1 << KCC_NEG_INNOV_DAMPEN_SHIFT = 4) do we reset the
+                 * directional-skip counter.  This protects Tier-1/Tier-2 drift detection
+                 * from being interrupted by transient reordering artifacts. */
                 x_updated = true;
-                ext->pos_skip_cnt = 0;
+                if (neg_innov_dampened) {
+                    u8 dampen_thresh = (u8)(1U << KCC_NEG_INNOV_DAMPEN_SHIFT);
+                    ext->neg_innov_cnt = (ext->neg_innov_cnt < dampen_thresh - 1) ? ext->neg_innov_cnt + 1 : 0;
+                    if (ext->neg_innov_cnt == 0) {
+                        ext->pos_skip_cnt = 0;                              /* full correction equivalent accumulated: reset drift counter */
+                    }
+                }
+                else {
+                    ext->pos_skip_cnt = 0;                                    /* qboost: full-gain path-change update -- immediately reset */
+                }
             }
             else {
                 /* [T_prop] Positive innovation without Q-boost: queue noise or baseline drift.
@@ -11886,6 +11911,9 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                 }
                 else if (drift_tier == KCC_DRIFT_TIER2) {
                     p_reduction >>= KCC_DRIFT_TIER2_SHIFT;  /* Tier-2: match corr/8 correction */
+                }
+                else if (neg_innov_dampened) {
+                    p_reduction >>= KCC_NEG_INNOV_DAMPEN_SHIFT;  /* Neg-innov: match dampened correction */
                 }
                 p_new = (u64)p_pred - p_reduction;
                 ext->p_est = max_t(u32, (u32)p_new, kcc_kalman_p_est_floor_val);

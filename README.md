@@ -656,7 +656,7 @@ The `min(0,·)` form makes explicit that ONLY negative innovations (RTT decrease
 
 - **(A1) PHYSICAL CONSTRAINT:** T_prop cannot increase due to congestion. Propagation delay is determined by physical path length and medium refractive index; neither changes with buffer occupancy. Therefore any observed RTT increase above the current T_prop estimate MUST originate from T_queue or T_noise, never from T_prop.
 
-- **(A2) INFORMATION NULLITY OF POSITIVE RESIDUALS:** Positive innovations ν_k > 0 contain ZERO Fisher information about T_prop. Formally: I_{T_prop}(ν_k | ν_k > 0) = 0 because the event {ν_k > 0} informs only about T_queue > 0 (congestion presence), not about the value of T_prop.
+- **(A2) INFORMATION NULLITY OF POSITIVE RESIDUALS:** Positive innovations ν_k > 0 contain ZERO Fisher information about T_prop. Formally: $$I_{T_prop}(ν_k | ν_k > 0) = 0$$ because the event $${ν_k > 0}$$ informs only about T_queue > 0 (congestion presence), not about the value of T_prop.
 
 - **(A3) BOUNDED MEASUREMENT NOISE:** The noise component η_k satisfies |η_k| ≤ η_max < ∞ almost surely (all physical delay sources have bounded magnitude).
 
@@ -2196,9 +2196,7 @@ The following cases extend the boundary coverage beyond B1–B16, covering addit
 
 #### B20 — Packet Reordering (Non-Congestion)
 
-**CRITICAL CASE:** Reordering can produce false RTT drops — out-of-order ACKs carry earlier timestamps → spurious RTT values below current `x_est` → directional gate INCORRECTLY accepts them as clean samples.
-
-**Bounded impact proof:** (i) The jitter EWMA outlier gate (multiplier 5×, Chebyshev P ≤ 4%) rejects reordering-induced RTT drops exceeding 5σ below current estimate. (ii) `min_rtt_us` sliding window provides a physical floor. (iii) Reordering-induced errors are transient: on subsequent correct ACKs, RTT returns to normal. Net effect: bounded over-estimate of at most the jitter threshold (≤5ms), converging within 5 RTTs.
+Reordering produces two effects: (a) RTT increase — safely rejected by directional gate. (b) RTT decrease (early ACK) — negative innovation passes directional gate. Defense: negative innovations are dampened by `KCC_NEG_INNOV_DAMPEN_SHIFT` (corr/4), converting single-sample trust into a multi-sample filter. A single reordering event causes only 1/4 of the naive x_est displacement; ~4 clean samples are needed for the same downward correction magnitude. Q-boost (path change) is not dampened. See B29 for full discussion.
 
 #### B21 — Delayed ACK (40ms Linux Default)
 
@@ -2234,21 +2232,23 @@ The following cases extend the boundary coverage beyond B1–B16, covering addit
 
 **Model:** Buffer holds up to `B_max` bytes (multi-second at line rate). Directional gate rejects ALL positive innovations. `x_est` frozen. `min_rtt` inflated. PROBE_RTT forced drain (200ms at cwnd_min = 4 MSS) empties buffer. Recovery bounded by $$buffer_drain_time + convergence_time ≤ PROBE_RTT_interval + 40 RTTs ≈ 40s$$ worst case.
 
-#### B29 — Packet Reordering → False RTT Spikes (Congestion Mimicry)
+#### B29 — Packet Reordering → False RTT Spikes / Drops
 
-**Physical model:** Reordering due to ECMP/LAG hashing or parallel forwarding planes. A packet sent earlier but received later produces $$z_k = t_now − t_send^(early) > true RTT$$ — a positive innovation indistinguishable from queue.
+**Physical model:** Reordering due to ECMP/LAG hashing or parallel forwarding planes. Two distinct cases:
 
-**CRITICAL OBSERVATION — safe by directional conservatism:** The directional update rejects ALL positive innovations regardless of cause. Whether RTT increase is from queue or reordering, `x_est` is NOT pulled upward. This is a robustness property.
+1. **Late delivery → RTT increase (handled):** Positive innovation rejected by directional gate. Zero impact on `x_est`.
 
-**Proof of safety:** Let reordering events occur at rate `p_reorder`. Each creates a positive innovation rejected by the directional gate. Information loss ratio = `p_reorder / (p_clean + p_reorder)`. For $$p_reorder ≤ 0.01$$ and $$p_clean ≥ 0.3$$: loss ≤ 3.2%. `min_rtt_us` sliding window captures a correctly-ordered minimum — not affected by reordering.
+2. **Early ACK → RTT decrease (mitigated):** Negative innovation passes directional gate. Mitigation: single-sample negative innovations are dampened by `KCC_NEG_INNOV_DAMPEN_SHIFT` (corr/4) — a reordering event causes only 1/4 of the naive x_est displacement. The `neg_innov_cnt` counter requires 4 consecutive dampened negatives before resetting the drift counter (`pos_skip_cnt`), preventing single reordering events from interrupting Tier-1/Tier-2 drift detection.
 
-**Theorem (reordering robustness):** Under directional update:
+**Trade-off:** Genuine path improvements converge over ~4 clean samples (4 RTTs) rather than instantaneously. This is an intentional conservatism: BBR's 10-second min_rtt window would take longer to reflect a path improvement, and Copa's delay-based window has similar smoothing. The 4-sample dampening is faster than BBR's windowed min_rtt for sudden path improvements while providing single-sample reordering immunity.
 
-1. Reordering → RTT increase: rejected as positive innovation → zero impact on `x_est`
-2. Reordering → RTT decrease: bounded by outlier gate (≤5× jitter_ewma) and `min_rtt` floor
-3. Net effect: $$x_est ≤ true T_prop + max(jitter_thresh, reordering_bias)$$ at all times
+**ISS stability proof (updated):** The dampened negative-innovation update introduces an effective Kalman gain `K_eff = β · K` where `β = 1/4` (2⁻²). The Lyapunov dissipation inequality for the Kalman observer subsystem becomes:
 
-**False negative risk (reordering → false RTT drop):** The outlier gate (5× jitter_ewma threshold) rejects reordering-induced RTT drops that exceed the jitter threshold. The min_rtt_us sliding window prevents persistent under-estimation. KCC's directional update is intrinsically robust to packet reordering — the conservative bias is an accidental but correct defense against reordering-induced false congestion signals, a structural advantage over symmetric estimators (standard Kalman, BBR's windowed min/max) that would track reordering artifacts.
+$$\Delta V_O \leq -(2\beta K - \beta^2 K^2) \cdot V_O + \sigma_O \cdot \|(q/C, \eta)\|^2$$
+
+With `K_ss = 0.39`, the effective decay rate `α_O_eff = 2(0.25·0.39) − (0.25·0.39)² ≈ 0.186` compared to the original `α_O = 0.39`. The small-gain condition `γ_loop = K_eff < 1` is still satisfied (`0.25·0.39 = 0.0975 < 1`). The ISS cascade (Theorems 5–6) holds with the modified decay rate — stability is preserved; convergence is slower by a factor of ~1/β = 4 for the downward direction. See Theorem 5 (§5.7) for the original small-gain derivation.
+
+**Performance trade-off:** When reordering rate < 1/4 per RTT, the dampening imposes no additional performance cost beyond slower path-improvement convergence. Extrmely low-latency-sensitive applications may consider reducing `KCC_NEG_INNOV_DAMPEN_SHIFT` (code constant, not a runtime parameter). On paths with frequent micro-reordering AND persistent congestion, dampened negatives accumulate via `neg_innov_cnt` and may reset `pos_skip_cnt` after 4 consecutive events — a second-order effect statistically negligible at typical reordering rates (<1%).
 
 #### B30 — ACK Compression/Thinning (Aggressive Coalescing)
 
