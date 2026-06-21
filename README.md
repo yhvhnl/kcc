@@ -1221,7 +1221,7 @@ The full loop has four gain stages:
 
 **Nonlinear ISS-Lyapunov gain computation.** The ISS small-gain theorem (Jiang & Mareels 1997) requires Lyapunov-based gains, not DC gains. Each subsystem S_i has an ISS-Lyapunov function V_i with dissipation inequality ΔV_i ≤ −α_i V_i + γ_i ‖u_i‖². The cascade composition satisfies ΔV ≤ −α V + γ ‖w‖² with α = min(α₁, α₂)/2 and γ = max(γ₁, γ₂) + γ₁·γ₂/(2α). For KCC: α_P = 1 (Lindley), α_O = 2K−K² (observer), γ_P = 1/C², γ_O = K². The small-gain condition γ_cascade < 1 reduces to K²/C² < 1, which is satisfied for all K < C — and K_ss < 1, C ≥ 1 (at least 1 segment per RTT). All three phases satisfy γ_loop < 1 with K_ss = 0.39, guaranteeing ISS stability by Theorem 3.
 
-**Effective gain with negative-innovation dampening.** The negative-innovation dampening mechanism (B29, `KCC_NEG_INNOV_DAMPEN_SHIFT=2`) introduces an effective observer gain $$K_{eff} = β · K_{ss}$$ where $$β = 1/4$$ for the downward direction. In DRAIN and CRUISE phases where negative innovations pass the gate: $$γ_{loop} = g · β · K_{ss} = g · 0.25 · 0.39 = g · 0.0975 < 1$$ for any $$g ∈ [0.75, 1.0]$$. The observer dissipation becomes $$ΔV_O ≤ −(2βK − β²K²)·V_O + σ_O·‖(q/C,η)‖²$$ with effective decay rate $$α_{O\_eff} ≈ 0.186$$ (original $$α_O ≈ 0.39$$). Stability is preserved; downward convergence rate is reduced by factor 4. The small-gain margin increases from $$1 − K_{ss} = 0.61$$ to $$1 − β·K_{ss} = 0.9025$$, providing additional robustness.
+**Effective gain with negative-innovation dampening.** The negative-innovation dampening mechanism (B29, `kcc_neg_innov_dampen_shift` sysctl, default 2) introduces an effective observer gain $$K_{eff} = β · K_{ss}$$ where $$β = 2^{-s}$$ and s is the configured shift. With s=2 (default): $$β = 1/4$$. In DRAIN and CRUISE phases where negative innovations pass the gate: $$γ_{loop} = g · β · K_{ss} = g · 0.25 · 0.39 = g · 0.0975 < 1$$ for any $$g ∈ [0.75, 1.0]$$. The observer dissipation becomes $$ΔV_O ≤ −(2βK − β²K²)·V_O + σ_O·‖(q/C,η)‖²$$ with effective decay rate $$α_{O\_eff} ≈ 0.186$$ (original $$α_O ≈ 0.39$$). Stability is preserved; downward convergence rate is reduced by factor $$1/β$$. The small-gain margin increases from $$1 − K_{ss} = 0.61$$ to $$1 − β·K_{ss} = 0.9025$$ (at s=2), providing additional robustness. At s=0 (dampening disabled): original gain, original proof applies.
 
 ---
 
@@ -2240,21 +2240,21 @@ Reordering produces two effects: (a) RTT increase — safely rejected by directi
 
 1. **Late delivery → RTT increase (handled):** Positive innovation rejected by directional gate. Zero impact on `x_est`.
 
-2. **Early ACK → RTT decrease (mitigated):** Negative innovation passes directional gate. Mitigation: single-sample negative innovations are dampened by `KCC_NEG_INNOV_DAMPEN_SHIFT` (corr/4) — a reordering event causes only 1/4 of the naive x_est displacement. The `neg_innov_cnt` counter requires 4 consecutive dampened negatives before resetting the drift counter (`pos_skip_cnt`), preventing single reordering events from interrupting Tier-1/Tier-2 drift detection.
+2. **Early ACK → RTT decrease (mitigated):** Negative innovation passes directional gate. Mitigation: single-sample negative innovations are dampened by the runtime-configurable `kcc_neg_innov_dampen_shift` (sysctl, default 2 → K·|ν|/4). The `neg_innov_cnt` counter requires `1 << shift` (4 at default) consecutive dampened negatives before resetting the drift counter (`pos_skip_cnt`), preventing single reordering events from interrupting Tier-1/Tier-2 drift detection. Set to 0 for original undampened behavior; range [0,4].
 
 **Trade-off:** Genuine path improvements converge over ~4 clean samples (4 RTTs best-case; congested or sample-sparse paths may take longer). Unlike BBR's 10-second min_rtt window or Copa's delay-based smoothing, the 4-sample dampening is intentionally faster than periodic windows for sudden path improvements while providing single-sample reordering immunity.
 
 **Note on p_est recovery:** The covariance `p_est` is NOT dampened — it drops at full Kalman gain. This prevents the filter from remaining in an artificially 'uncertain' state during path improvements, which would otherwise trigger conservative mechanisms (PROBE_RTT scheduling, gain decay, ECN backoff). This is a deliberate departure from strict Kalman covariance-scaling consistency, justified by the operational semantics of `p_est` in the KCC framework, where it gates multiple throughput-relevant decisions beyond pure estimation accuracy.
 
-**Extreme reordering boundary:** When reorder rate exceeds `1/(1 << KCC_NEG_INNOV_DAMPEN_SHIFT) = 1/4` per RTT, reordering-induced negative innovations dominate `neg_innov_cnt`, causing frequent resets of `pos_skip_cnt` and delaying Tier-2 drift correction. Above this rate, x_est may slowly track reordering noise rather than true propagation delay. This is the structural limit of any single-sample RTT estimator without cross-layer signals (DSACK, timestamp consistency).
+**Extreme reordering boundary:** When reorder rate exceeds `1 / (1 << kcc_neg_innov_dampen_shift)` = 25% at default shift=2, reordering-induced negative innovations dominate `neg_innov_cnt`, causing frequent resets of `pos_skip_cnt` and delaying Tier-2 drift correction. Above this rate, x_est may slowly track reordering noise rather than true propagation delay. This is the structural limit of any single-sample RTT estimator without cross-layer signals (DSACK, timestamp consistency).
 
-**ISS stability proof (updated):** The dampened negative-innovation update introduces an effective Kalman gain `K_eff = β · K` where `β = 1/4` (2⁻²). The Lyapunov dissipation inequality for the Kalman observer subsystem becomes:
+**ISS stability proof (updated):** The dampened negative-innovation update introduces an effective Kalman gain `K_eff = β · K` where `β = 2^{-s}` and `s = kcc_neg_innov_dampen_shift` (default 2, β=1/4). The Lyapunov dissipation inequality for the Kalman observer subsystem becomes:
 
 $$\Delta V_O \leq -(2\beta K - \beta^2 K^2) \cdot V_O + \sigma_O \cdot \|(q/C, \eta)\|^2$$
 
 With `K_ss = 0.39`, the effective decay rate `α_O_eff = 2(0.25·0.39) − (0.25·0.39)² ≈ 0.186` compared to the original `α_O = 0.39`. The small-gain condition `γ_loop = K_eff < 1` is still satisfied (`0.25·0.39 = 0.0975 < 1`). The ISS cascade (Theorems 5–6) holds with the modified decay rate — stability is preserved; convergence is slower by a factor of ~1/β = 4 for the downward direction. See Theorem 5 (§5.7) for the original small-gain derivation.
 
-**Performance trade-off:** When reordering rate < 1/4 per RTT, the dampening imposes no additional performance cost beyond slower path-improvement convergence. Extremely low-latency-sensitive applications may consider reducing `KCC_NEG_INNOV_DAMPEN_SHIFT` (compile-time constant, requires module rebuild; not a sysctl — lowering it weakens reordering defense). On paths with frequent micro-reordering AND persistent congestion, dampened negatives accumulate via `neg_innov_cnt` and may reset `pos_skip_cnt` after 4 consecutive events — a second-order effect statistically negligible at typical reordering rates (<1%).
+**Performance trade-off:** When reordering rate < 1/4 per RTT (at default shift=2), the dampening imposes no additional performance cost beyond slower path-improvement convergence. Set `kcc_neg_innov_dampen_shift` lower for faster convergence on clean paths, higher for stronger defense on reordering-heavy paths (sysctl, range [0,4]; lower values weaken reordering defense). On paths with frequent micro-reordering AND persistent congestion, dampened negatives accumulate via `neg_innov_cnt` and may reset `pos_skip_cnt` after `1<<shift` consecutive events — a second-order effect statistically negligible at typical reordering rates (<1%).
 
 #### B30 — ACK Compression/Thinning (Aggressive Coalescing)
 
@@ -4004,6 +4004,7 @@ For most deployments, these parameters cover the primary tuning surface (~10 of 
 | `kcc_jitter_r_scale` | 8000 | R (measurement noise) scaling divisor | Increase to desensitize Kalman to jitter |
 | `kcc_probe_rtt_decouple` | 1 | PROBE_RTT interval strategy | Set to 0 to disable periodic probing |
 | `kcc_kf_enable` | 0 | Global Kalman BDP filter | Enable only for single-homed servers |
+| `kcc_neg_innov_dampen_shift` | 2 | Negative-innovation dampening shift | 0=off; 1=faster; 3-4=stronger reorder defense |
 
 ---
 

@@ -5969,7 +5969,47 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_DRIFT_TIER2_SHIFT        3      /* [T_noise] Tier-2 correction divisor: corr>>3=corr/8 */
 #define KCC_POS_SKIP_SATURATION      254    /* [T_noise] pos_skip_cnt ceiling; derivation: pos_skip_cnt is u8 (max 255); Tier-2 drift threshold = drift_thresh * 8 = 16 * 8 = 128; saturation at 254 (not 255) provides a 2-value safety margin below u8 max, preventing arithmetic wrap-around from triggering a false Q-boost suppression release; 254 > 128 ensures Tier-2 activation is always reachable; the gap 254-128 = 126 gives 126 RTTs of post-Tier-2 counting headroom before saturation */
 #define KCC_P_EST_SAT_POS_SKIP_THRESH 64     /* [K] pos_skip_cnt threshold for p_est-saturation response; derivation: this check fires BEFORE Tier-2 drift correction in the positive-innovation branch; Tier-2 at drift_thresh*8=128 resets pos_skip_cnt to 0, so saturation MUST use a lower threshold to avoid perpetual preemption; 64 = drift_thresh*4 = 16*4 gives P = 2^(-64) ≅ 5.4×10⁻²⁰ (Neyman-Pearson), still overwhelmingly rejecting H_0; invariant enforced at clamp: saturation_thresh < drift_thresh * KCC_DRIFT_TIER2_MULT */
-#define KCC_NEG_INNOV_DAMPEN_SHIFT    2      /* [T_prop] Negative-innovation dampening: corr>>2 = K*|innov|/4.  Single RTT samples are not individually trustworthy — reordering, ACK compression, and transient noise can produce false negative innovations.  Dampening converts the 'instant single-sample trust' of the directional gate into a multi-sample filter: ~4 clean samples are required for the same magnitude of downward correction.  Genuine path improvements (which persist) still converge fully; single-sample artifacts (reordering) cause only 1/4 of the damage.  Q-boost (forced path-change update) is NOT dampened — it passes at full gain. */
+#define KCC_NEG_INNOV_DAMPEN_SHIFT_DEFAULT 2  /* [T_prop] Negative-innovation dampening shift (default 2, corr>>2 = K*|innov|/4).
+ * DERIVATION:
+ *   The directional gate accepts all negative innovations, but single RTT
+ *   samples are individually untrustworthy — reordering produces false
+ *   negatives.  Dampening converts single-sample trust into a multi-sample
+ *   consensus filter via the neg_innov_cnt counter:
+ *     reset_pos_skip = (neg_innov_cnt >= (1 << shift))
+ *   i.e., 1 << shift consecutive dampened negatives are required before
+ *   the drift counter (pos_skip_cnt) is reset.
+ *
+ *   Choosing shift = 2:
+ *     Consensus window = 4 consecutive negatives
+ *     Effective gain beta = 1/4
+ *
+ *   At reorder rate p_reorder (per RTT):
+ *     E[T_reset] = 4 / p_reorder  RTTs to reset drift counter
+ *     For p_reorder = 1%: E[T_reset] = 400 RTTs
+ *       — well above Tier-2's 128-RTT window; drift fires first
+ *     For p_reorder = 25%: E[T_reset] = 16 RTTs
+ *       — this is the design boundary (per B29); above this, reordering
+ *         dominates neg_innov_cnt and Tier-2 is delayed
+ *
+ *   At genuine path improvement with p_clean = 30% (typical):
+ *     E[T_converge] = 4 / 0.3 ≈ 13 RTTs
+ *       — faster than BBR's 10s min_rtt window or Copa's smoothing
+ *
+ *   Shift = 1 (2-sample, 7 RTTs at p_clean=30%):
+ *     Faster convergence but weaker defense (100 RTTs at p_reorder=1%)
+ *   Shift = 3 (8-sample, 27 RTTs at p_clean=30%):
+ *     Stronger defense but impractically slow convergence
+ *   Shift = 4: 16 samples needed — no longer provides responsive path tracking
+ *
+ *   Shift = 2 is the midpoint that balances defense (400 RTTs at 1% reorder)
+ *   with convergence (13 RTTs at 30% clean).  The ISS small-gain condition is
+ *   beta * K_ss = 0.25 * 0.39 = 0.0975 < 1 — satisfied with wide margin.
+ *
+ *   The neg_innov_cnt reset threshold is (1 << shift), so the counter range is
+ *   [0, (1<<shift)-1].  Changing shift automatically adapts the threshold.
+ *   Q-boost (path-change detection) is NOT dampened — it passes at full gain.
+ */
+#define KCC_NEG_INNOV_DAMPEN_SHIFT_DERIVED_RESET_THRESH(s)  ((1U << (s)) - 1)  /* Explicit coupling: reset threshold = (1<<shift)-1.  For shift=2: 3 counter ticks → 4th sample resets. */
 
      /* PARAMETER DERIVATION: KCC_TSO_DIV_FLOOR / CEIL / HALVE_SHIFT / DOUBLE_SHIFT
       *
@@ -6235,7 +6275,7 @@ struct kcc_ext {
     u8  qboost_cdwn;                                 /* [K] cooldown counter: min accepted samples between qboost events; prevents runaway resets */
 
     u8  pos_skip_cnt;                                /* [T_noise] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
-    u8  neg_innov_cnt;                               /* [T_prop] consecutive dampened negative innovations; reset threshold = (1<<KCC_NEG_INNOV_DAMPEN_SHIFT)-1; implicitly coupled to dampening factor — if SHIFT changes, threshold adapts automatically via (1U<<SHIFT); see kcc_kalman_update() acceptance path */
+    u8  neg_innov_cnt;                               /* [T_prop] consecutive dampened negative innovations; counts 0..(1<<shift)-1, resets to 0 on the (1<<shift)-th consecutive dampened negative, triggering pos_skip_cnt reset; threshold = (1U << kcc_neg_innov_dampen_shift_val), adapts automatically when shift changes */
     u8  alone_exit_cnt;                              /* [T_noise] consecutive alone_eval failures; exit hysteresis for multi-flow resonance resistance */
 
     struct list_head kcc_node;                                              /* [K] list node in module-global kcc_conn_list for /proc/kcc/status */
@@ -7284,6 +7324,29 @@ module_param_cb(kcc_kalman_pos_skip_thresh, &kcc_param_ops, &kcc_kalman_pos_skip
 static int kcc_kalman_drift_thresh = 16;                  /* [K] consecutive directional skips before forced baseline-drift state update; must be >= pos_skip_thresh and <= 31 (so Tier-2 threshold drift_thresh*8 <= 254 fits in u8 counter); prevents x_est lock-in on stale baseline under wireless RTT drift; KCC-only; range [4, 31], BBR default: N/A */
 module_param_cb(kcc_kalman_drift_thresh, &kcc_param_ops, &kcc_kalman_drift_thresh, 0644); /* [K] sysctl: kcc_kalman_drift_thresh */
 /*
+ * [T_prop] kcc_neg_innov_dampen_shift -- Negative-innovation dampening shift.
+ *
+ * PHYSICS: Reordering produces false negative innovations (early ACKs with
+ * earlier timestamps -> spurious RTT below true T_prop).  Without dampening,
+ * a single reordered ACK passes the directional gate and pulls x_est
+ * downward, causing BDP underestimation.
+ *
+ * DERIVATION: See KCC_NEG_INNOV_DAMPEN_SHIFT_DEFAULT for full derivation.
+ * Default shift=2: K_eff = K>>2 = K/4.  neg_innov_cnt requires (1<<shift)=4
+ * consecutive dampened negatives before resetting pos_skip_cnt (drift counter).
+ *   E[T_converge] = 4 / p_clean  RTTs for genuine path improvement
+ *   E[T_reset]   = 4 / p_reorder RTTs for reordering to reset drift
+ * ISS small-gain: beta*K_ss = 0.25*0.39 = 0.0975 < 1 — satisfied at all shifts.
+ *
+ * RANGE: [0, 4].  0 = no dampening (original behavior, vulnerable to reordering).
+ * 1 = K>>1 (fast convergence, moderate defense).  2 = K>>2 (balanced, default).
+ * 3 = K>>3 (strong defense, slower convergence).  4 = K>>4 (max defense).
+ *
+ * A shift outside [0,4] is clamped at module init.
+ */
+static int kcc_neg_innov_dampen_shift = KCC_NEG_INNOV_DAMPEN_SHIFT_DEFAULT; /* [T_prop] negative-innovation dampening shift; range [0,4]; default 2; KCC-only */
+module_param_cb(kcc_neg_innov_dampen_shift, &kcc_param_ops, &kcc_neg_innov_dampen_shift, 0644); /* [T_prop] sysctl: kcc_neg_innov_dampen_shift */
+/*
  * [K] kcc_kalman_saturation_thresh -- Consecutive positive-direction skips
  * before p_est-saturation response fires.
  *
@@ -8075,6 +8138,7 @@ static u32 kcc_kalman_pos_skip_thresh_val;                   /* [K] clamped pos-
 static u32 kcc_kalman_drift_thresh_val;                      /* [K] clamped drift threshold */
 static u32 kcc_kalman_saturation_thresh_val;                /* [K] clamped p_est-saturation pos_skip threshold */
 static u32 kcc_startup_max_rtts_val;                        /* [K] clamped STARTUP max RTTs */
+static u32 kcc_neg_innov_dampen_shift_val;                   /* [T_prop] clamped negative-innovation dampening shift */
 static u32 kcc_alone_exit_thresh_val;                        /* [T_queue] clamped alone exit hysteresis */
 static int kcc_kalman_q_max_val;                            /* [K] clamped Q max */
 static int kcc_kalman_q_scale_cap_val;                      /* [K] clamped Q scale cap */
@@ -8325,6 +8389,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_full_bw_thresh_den = clamp(kcc_full_bw_thresh_den, 1, 100000); /* [K] full-BW threshold denominator */
     kcc_full_bw_cnt = clamp(kcc_full_bw_cnt, 1, 3);                    /* [K] full-BW round count */
     kcc_startup_max_rtts = clamp(kcc_startup_max_rtts, 32, 1024);       /* [K] STARTUP max RTTs */
+    kcc_neg_innov_dampen_shift = clamp(kcc_neg_innov_dampen_shift, 0, 4); /* [T_prop] neg-innov dampening shift: 0=off, 4=max defense */
 
     kcc_pacing_margin_num = clamp(kcc_pacing_margin_num, 0, 50);        /* [K] pacing margin numerator */
     kcc_pacing_margin_den = clamp(kcc_pacing_margin_den, 1, 100000);    /* [K] pacing margin denominator */
@@ -8566,6 +8631,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kalman_drift_thresh_val = (u32)kcc_kalman_drift_thresh;  /* cache clamped drift threshold */
     kcc_kalman_saturation_thresh_val = (u32)kcc_kalman_saturation_thresh;  /* [K] p_est-saturation pos_skip threshold */
     kcc_startup_max_rtts_val = (u32)kcc_startup_max_rtts; /* [K] STARTUP max RTTs */
+    kcc_neg_innov_dampen_shift_val = (u32)kcc_neg_innov_dampen_shift; /* [T_prop] neg-innov dampening shift */
     kcc_alone_exit_thresh_val = (u32)kcc_alone_exit_thresh;  /* cache clamped alone-exit hysteresis threshold */
     kcc_kalman_q_max_val = kcc_kalman_q_max;  /* [K] Q maximum */
     kcc_kalman_q_scale_cap_val = kcc_kalman_q_scale_cap;  /* [K] Q scale cap */
@@ -11728,7 +11794,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                  * is NOT dampened — it passes at full Kalman gain. */
                 correction = (innovation >= 0) ? (s64)min_t(u64, corr_abs, KCC_S64_MAX) : -(s64)min_t(u64, corr_abs, KCC_S64_MAX);
                 if (innovation < 0) {
-                    correction >>= KCC_NEG_INNOV_DAMPEN_SHIFT;                      /* dampen single-sample downward updates */
+                    correction >>= kcc_neg_innov_dampen_shift_val;            /* dampen single-sample downward updates */
                     neg_innov_dampened = true;                                        /* scale covariance reduction to match */
                 }
 
@@ -11752,7 +11818,11 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                  * from being interrupted by transient reordering artifacts. */
                 x_updated = true;
                 if (neg_innov_dampened) {
-                    u8 dampen_thresh = (u8)(1U << KCC_NEG_INNOV_DAMPEN_SHIFT);
+                    /* neg_innov_cnt counts 0..(1<<shift)-1, resets to 0 at the
+                     * (1<<shift)-th consecutive dampened negative innovation.
+                     * For shift=2: count 0→1→2→3→0, resetting pos_skip_cnt on 4th sample. */
+                    u8 dampen_thresh = (u8)(1U << kcc_neg_innov_dampen_shift_val);
+                    if (dampen_thresh > 0) {
                     ext->neg_innov_cnt = (ext->neg_innov_cnt < dampen_thresh - 1) ? ext->neg_innov_cnt + 1 : 0;
                     if (ext->neg_innov_cnt == 0) {
                         ext->pos_skip_cnt = 0;                              /* full correction equivalent accumulated: reset drift counter */
@@ -13939,6 +14009,7 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_full_bw_thresh_den",      .data = &kcc_full_bw_thresh_den,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] full-BW growth threshold denominator; BBR default: 100 */
     {.procname = "kcc_full_bw_cnt",             .data = &kcc_full_bw_cnt,             .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..3] consecutive rounds without growth to declare full_bw; BBR default: 3 */
     {.procname = "kcc_startup_max_rtts",         .data = &kcc_startup_max_rtts,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [32..1024] max STARTUP RTTs before forced DRAIN; default 64 */
+    {.procname = "kcc_neg_innov_dampen_shift",   .data = &kcc_neg_innov_dampen_shift,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..4] negative-innovation dampening shift; 0=off, 2=K>>2 (default), 4=max; controls neg_innov_cnt consensus window size */
     /* Pacing margin */
     {.procname = "kcc_pacing_margin_num",       .data = &kcc_pacing_margin_num,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..50] pacing margin numerator; BBR default: 1 (1%) */
     {.procname = "kcc_pacing_margin_den",       .data = &kcc_pacing_margin_den,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] pacing margin denominator; BBR default: 100 */
