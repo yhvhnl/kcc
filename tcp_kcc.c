@@ -11823,11 +11823,11 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                      * For shift=2: count 0→1→2→3→0, resetting pos_skip_cnt on 4th sample. */
                     u8 dampen_thresh = (u8)(1U << kcc_neg_innov_dampen_shift_val);
                     if (dampen_thresh > 0) {
-                    ext->neg_innov_cnt = (ext->neg_innov_cnt < dampen_thresh - 1) ? ext->neg_innov_cnt + 1 : 0;
-                    if (ext->neg_innov_cnt == 0) {
-                        ext->pos_skip_cnt = 0;                              /* full correction equivalent accumulated: reset drift counter */
+                        ext->neg_innov_cnt = (ext->neg_innov_cnt < dampen_thresh - 1) ? ext->neg_innov_cnt + 1 : 0;
+                        if (ext->neg_innov_cnt == 0) {
+                            ext->pos_skip_cnt = 0;                              /* full correction equivalent accumulated: reset drift counter */
+                        }
                     }
-                }
                 else {
                     ext->pos_skip_cnt = 0;                                    /* qboost: full-gain path-change update -- immediately reset */
                 }
