@@ -124,7 +124,7 @@ See the **Reading Guide** (§above) and **Part III: Nonlinear Mechanisms in Impl
 
 ## Part I: Design Rationale — Model Identifiability Arguments
 
-> **📖 Reading note:** This section contains the formal mathematical proofs establishing why the three-component model is the correct architecture. **New readers may skip Parts I–II on first reading** and start with [Part III: Engineering Implementation](#part-iii-engineering-implementation--nonlinear-mechanisms) or the [Troubleshooting Guide](#troubleshooting-guide) for operational understanding. Return here when you need the mathematical justification.
+> Reading note: This section contains the formal mathematical proofs establishing why the three-component model is the correct architecture. **New readers may skip Parts I–II on first reading** and start with [Part III: Engineering Implementation](#part-iii-engineering-implementation--nonlinear-mechanisms) or the [Troubleshooting Guide](#troubleshooting-guide) for operational understanding. Return here when you need the mathematical justification.
 
 ### Why the Three-Component Model IS Correct for Congestion Control — Formal Proofs E/E1/F
 
@@ -4214,7 +4214,7 @@ New connections seeded with the shared estimate begin at the dessert-speed pacin
 The Global Kalman BDP filter is based on the author's article _On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel_ (CC BY-SA 4.0):
 <https://blog.csdn.net/liulilittle/article/details/161635652>
 
-> **⚠️ Caveat — Multi-Homed / Anycast Environments:** The Global Kalman Filter operates on a per-host basis. In multi-homed, Anycast, or ECMP deployments where different server instances serve the same destination, each host maintains an independent KF estimate. These estimates may diverge, causing cross-host fairness bias. **Recommendation:** Enable `kcc_kf_enable` only in single-homed deployments where all connections share the same bottleneck path. On multi-homed hosts, leave disabled (the per-connection Kalman filter provides adequate bandwidth estimation independently).
+> Caveat — Multi-Homed / Anycast Environments: The Global Kalman Filter operates on a per-host basis. In multi-homed, Anycast, or ECMP deployments where different server instances serve the same destination, each host maintains an independent KF estimate. These estimates may diverge, causing cross-host fairness bias. **Recommendation:** Enable `kcc_kf_enable` only in single-homed deployments where all connections share the same bottleneck path. On multi-homed hosts, leave disabled (the per-connection Kalman filter provides adequate bandwidth estimation independently).
 
 ---
 
