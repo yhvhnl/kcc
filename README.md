@@ -122,235 +122,9 @@ See the **Reading Guide** (§above) and **Part III: Nonlinear Mechanisms in Impl
 
 ---
 
-## Part I: Design Rationale — Model Identifiability Arguments
+## Part I: Design Rationale
 
-> Reading note: This section contains the formal mathematical proofs establishing why the three-component model is the correct architecture. **New readers may skip Parts I–II on first reading** and start with [Part III: Engineering Implementation](#part-iii-engineering-implementation--nonlinear-mechanisms) or the [Troubleshooting Guide](#troubleshooting-guide) for operational understanding. Return here when you need the mathematical justification.
-
-### Why the Three-Component Model IS Correct for Congestion Control — Formal Proofs E/E1/F
-
-The comparison between four-component and three-component models is settled by the Fisher Information matrix, the Cramér-Rao bound, and the necessity of behavioral priors for end-to-end identifiability. These are not opinions — they are mathematical theorems taught in every graduate-level estimation theory course.
-
----
-
-**Proof E (Fisher Information Singularity — Four-Component Impossibility).**
-
-Let θ = [T_prop, T_trans(t), T_queue(t), T_proc(t)]^T be the four-component state vector at time t. The observation model is:
-
-$$
-z_t = T_prop + T_trans(t) + T_queue(t) + T_proc(t) + w_t    where w_t ~ N(0, σ²)
-$$
-
-Written in vector form: $$z_t = h^T θ_t + w_t$$ where $$h = [1, 1, 1, 1]^T$$ — all four components sum identically to the scalar RTT observation.
-
-**Step 1 — Fisher Information Matrix.** For N i.i.d. observations under Gaussian noise:
-
-$$
-I(θ) = (1/σ²) Σ h h^T = (N/σ²) · H
-$$
-
-where H = h h^T is the 4×4 all-ones matrix:
-
-$$
-H = \begin{bmatrix}
-1 & 1 & 1 & 1 \\
-1 & 1 & 1 & 1 \\
-1 & 1 & 1 & 1 \\
-1 & 1 & 1 & 1
-\end{bmatrix}
-$$
-
-The Fisher Information Matrix has **rank 1** while the parameter space has **dimension 4**. The rank deficiency is 3 — three independent linear combinations of the four parameters cannot be estimated from any number of scalar observations.
-
-**Step 2 — Cramér-Rao Bound.** For any unbiased estimator \hat{θ} of the four-component vector:
-
-$$
-Cov(\hat{θ}) ⪰ I⁻¹(θ)
-$$
-
-Since I(θ) is singular (rank 1 < dimension 4), its inverse does not exist in $R^{4\times4}$. The Cramér-Rao lower bound is infinite in 3 directions of the parameter space — corresponding to the three-dimensional nullspace of H. Specifically, any vector v satisfying $$h^T v = 0$$ yields $$v^T I(θ) v = 0$$, giving $$\mathrm{Var}(v^T \hat{θ}) \geq \infty$$ — meaning those parameter combinations are fundamentally unconstrained by the data.
-
-**Determinant computation:** $$\det(I(θ)) = (N/\sigma^2)^4 \cdot \det(H)$$. Since $$H = h \cdot h^T$$ is a rank-1 matrix with eigenvalues {4, 0, 0, 0}, $$\det(H) = 4 \cdot 0 \cdot 0 \cdot 0 = 0$$. Therefore $$\det(I(θ)) = 0$$ identically, confirming that the Fisher Information Matrix is singular and cannot be inverted — no unbiased estimator of the four-component vector exists.
-
-**Step 3 — Conclusion.** From scalar RTT observations alone, **no consistent estimator of all four components exists**. At most ONE linear combination (the sum itself) is identifiable. The four-component model overparametrizes the observation space by a factor of 4. Any congestion control algorithm that attempts to estimate all four components from end-to-end RTT is attempting to solve an information-theoretically impossible problem.
-
-**Nullspace Characterization (constrained Cramér-Rao).**
-
-The nullspace N(H) = {v ∈ R^4 : h^T v = 0} has dimension 3. A complete basis for the unidentifiable subspace:
-
-$$
-v_1 = [ 1,  0, -1,  0]^T   (T_prop vs T_queue trade-off)
-$$
-
-$$
-v_2 = [ 0,  1, -1,  0]^T   (T_trans vs T_queue trade-off)
-$$
-
-$$
-v_3 = [ 0,  0, -1,  1]^T   (T_queue vs T_proc trade-off)
-$$
-
-Any perturbation δ ∈ span{v_1, v_2, v_3} leaves RTT unchanged: h^T(θ + δ) = h^T θ. Individual components have infinite Cramér-Rao variance: Var(θ̂_i) ≥ [I⁻¹(θ)]_{ii} → ∞.
-
-The Moore-Penrose pseudo-inverse I†(θ) = (σ²/N)·(1/16)·H projects onto the identifiable 1D subspace: any unbiased estimator can recover only the total sum θ_sum (and thus θ_sum/4 = average component), with all four individual components perfectly aliased.
-
-**This is not an opinion.** This is the Cramér-Rao theorem (Rao 1945; Cramér 1946) applied to the RTT observation model. Any estimator claiming to recover four RTT components from end-to-end scalar measurements is making a claim that contradicts a fundamental result of statistical estimation theory.
-
----
-
-**Proof E1 (Bayesian Priors Cannot Salvage Four-Component Inference).**
-
-**Claim:** Even with Bayesian priors on T_trans and T_proc, the four-component model remains inferentially impossible for congestion control.
-
-**Proof:** The posterior precision matrix is:
-
-$$
-Λ_post = Λ_prior + (N/σ²) · H
-$$
-
-where Λ_prior is the prior precision (inverse covariance) matrix. For physically realistic priors (T_trans ~ constant on fixed path, T_proc ~ constant), Λ_prior has rank_prior ≤ 2 (only T_trans and T_proc have informative priors; T_prop and T_queue are unconstrained).
-
-The rank of Λ_post satisfies:
-
-$$
-rank(Λ_post) ≤ rank(Λ_prior) + rank(H) ≤ 2 + 1 = 3
-$$
-
-In the 4D parameter space, Λ_post remains singular — there exists at least one direction where posterior variance is infinite.
-
-**Precisely:** the degenerate direction v = [1, 0, -1, 0]^T (corresponding to T_prop vs T_queue difference) satisfies H·v = 0 (it is in the nullspace of H). If Λ_prior·v = 0 (the prior provides no constraint on this direction — which is exactly the case when priors are placed only on T_trans and T_proc), then:
-
-$$
-Λ_post · v = 0
-$$
-
-and v is perfectly unobservable. This direction is exactly T_prop vs T_queue — the CC-relevant subspace. Even with perfect prior knowledge of T_trans and T_proc (making them known constants and reducing the model to 2 components implicitly), T_prop and T_queue remain coupled in the scalar observation.
-
-The ONLY way to distinguish T_prop from T_queue is through behavioral priors (T_prop constant on fixed path) combined with directional conditioning — which is exactly what the three-component model provides, and exactly what the four-component model lacks by design (it classifies by location, not behavior).
-
-**Scope Qualification:** This holds for priors constrained to T_trans and T_proc (rank ≤ 2 physical-location priors). If behavioral priors (constant-on-path for T_prop, congestion-correlated for T_queue, zero-mean uncorrelated for noise) are applied to a four-component model, the posterior becomes identifiable but the result is OPERATIONALLY IDENTICAL to the three-component model: T_trans and T_proc collapse to known constants (prior-dominated), and only T_prop and T_queue are actively estimated. The extra components provide zero additional inference power — the four-component model under behavioral priors is just an over-parameterized reformulation of the three-component model, introducing spurious degrees of freedom that the data cannot constrain.
-
----
-
-**Proof F (Three-Component Identifiability through Behavioral Priors).**
-
-**Claim:** The three-component model is identifiable through behavioral priors, where the four-component model is not.
-
-**Definition of the three-component linear projection:**
-
-$$
-RTT_obs = T_prop* + T_queue(t) + T_noise(t)
-$$
-
-where:
-
-- $$T_prop* = T_prop + E[T_trans] + E[T_proc]$$ — all path-constant terms (the mean of the non-queue physical components)
-- $$T_queue(t) = T_queue_four(t)$$ — the same queue component from the four-component model
-- $$T_noise(t) = (T_trans(t) - E[T_trans]) + (T_proc(t) - E[T_proc]) + w_t$$ — all zero-mean fluctuations including measurement noise
-
-**The Fisher Information matrix** for the three-component model from N observations:
-
-$$
-I_3(θ_3) = (N/σ²) · [1 1 1; 1 1 1; 1 1 1]   (rank 1, dimension 3)
-$$
-
-This also has rank deficiency (rank 1 < 3). However, the three-component model adds **BEHAVIORAL PRIORS** that eliminate the rank deficiency:
-
-__Prior 1 (Constant T_prop_):_* $$Var(T_prop*) ≈ 0$$ on a fixed path.
-
-- T_prop* collapses to a single scalar across all N observations, reducing effective dimension from 3 to 2.
-- The prior precision in this direction is effectively infinite, giving Λ_prior rank = 1.
-- With Λ_prior of rank 1 and I_3 of rank 1, the posterior has effective rank ≤ 2, matching the 2D effective parameter space.
-
-**Prior 2 (Zero-mean T_noise):** $$E[T_noise(t)] = 0$$.
-
-- The Kalman innovation expectation satisfies $$E[ν_k | q_k = 0] = 0$$, providing an unbiased measurement of T_prop* on clean RTT samples.
-
-**Prior 3 (Directional conditioning):** Only $$ν_k < 0$$ samples update T_prop*.
-
-- This breaks the T_queue ↔ T_prop* degeneracy on the clean-sample subspace.
-- When q_k > 0: $$P(ν_k < 0) → 0$$, so queue-contaminated samples are structurally excluded from the estimation of T_prop*.
-
-**Result:** With all three priors, the effective FIM rank is 2 (T_prop* pinned, T_queue and T_noise estimable from C·T_prop bound and jitter statistics). The three-component model is **identifiable** where the four-component model is not — not because fewer components are defined, but because behavioral classification enables valid statistical conditioning that physical-location classification cannot provide.
-
-**Rank verification (Direct Determinant Proof):** Construct Λ_post explicitly. Let α = N/σ². Prior 1 (T_prop\* constant) contributes precision λ₁ > 0 in the e₁ = [1,0,0]^T direction. Priors 2,3 (zero-mean noise, directional conditioning) contribute precision λ₃ > 0 in the e₃ = [0,0,1]^T direction. Thus:
-
-$$
-Λ_prior = diag(λ₁, 0, λ₃),  rank = 2
-$$
-
-$$
-I_3 = α · [1 1 1; 1 1 1; 1 1 1],  rank = 1
-$$
-
-$$
-Λ_post = Λ_prior + I_3
-       = [ λ₁ + α,  α,      α        ]
-         [ α,        α,      α        ]
-         [ α,        α,      λ₃ + α   ]
-$$
-
-Row-reduce to compute the determinant:
-
-$$
-R1 ← R1 - R2:  [ λ₁,  0,  0    ]
-$$
-
-$$
-R3 ← R3 - R2:  [ 0,   0,  λ₃   ]
-$$
-
-$$
-R2 (unchanged): [ α,   α,  α    ]
-$$
-
-Cofactor expansion along R1:
-
-$$
-  det(Λ_post) = λ₁ · det([α, α; 0, λ₃])
-$$
-
-$$
-              = λ₁ · α · λ₃
-$$
-
-$$
-              = (N/σ²) · λ₁ · λ₃
-$$
-
-Since N > 0, σ² > 0, λ₁ > 0, λ₃ > 0: **det(Λ_post) > 0**, so Λ_post is full-rank (rank 3 = dim(θ_3comp)) and all parameters have finite Cramér-Rao variance.
-
-**Derivation of λ₃ from measurable quantities:** The claim λ₃ > 0 from Priors 2 and 3 requires explicit construction. λ₃ is the directional-conditioning precision on T_noise in the e₃ = [0,0,1]^T direction, derived from the empirical variance of directionally-conditioned innovations:
-
-- On clean samples (gate open, innovation accepted): ν_k = z_k − x_k = d_k + η_k. After convergence (d_k → 0): Var(ν_k | clean) = σ² = R.
-- The number of clean samples is N_clean = p_clean · N (total accepted innovations out of N observations).
-- The directional-conditioning precision in the e₃ direction is the information contributed by the censored-innovation structure: λ₃ = N_clean / Var(ν_clean) = p_clean · N / R.
-- Since p_clean > 0 (Proof C, boundary B1), N > 0, R > 0: **λ₃ = p_clean · N / R > 0**.
-- Therefore det(Λ_post) = (N/σ²) · λ₁ · λ₃ = (N/R) · λ₁ · (p_clean · N / R) = λ₁ · p_clean · N² / R² > 0, because all four factors (λ₁, p_clean, N, R) are positive.
-
-Note: rank additivity rank(A+B) = rank(A) + rank(B) is NOT assumed — the determinant is computed directly from the explicit matrix. The factored form det = (N/σ²)·λ₁·λ₃ shows identifiability requires ALL THREE information sources: observations (α), Prior 1 (λ₁), and Priors 2,3 (λ₃). Removing any single source zeroes the determinant, collapsing identifiability — confirming each behavioral prior is necessary, not merely helpful. The three-component model is fully identifiable.
-
-**Bootstrap Defense:** The identifiability proof CAN be staged without circularity:
-
-1. Start with ANY initial estimate x_0 ≥ 0.
-2. The directional gate produces p_clean > 0 for ANY estimate, because:
-   - Independent of the estimate quality, the queue occasionally drains (physical fact — queues are not permanent).
-   - During drain phases, RTT decreases (ΔRTT < 0) and the gate opens.
-   - The fraction of drain-phase rounds is lower-bounded by ρ_util/(1−ρ_util) in M/M/1, or more generally by link utilization.
-3. This guarantees a non-zero rate of gate-open rounds → p_clean > 0.
-4. p_clean > 0 → λ₃ > 0 → det(Λ_post) > 0 → identifiability.
-5. Identifiability → estimator convergence → improved p_clean → faster convergence (virtuous cycle).
-
-The bootstrap depends on the PHYSICAL fact that queues drain, not on estimator quality. The initial convergence is self-amplifying: coarse estimates still yield p_clean > 0, which provides the initial information for the estimator to improve.
-
-This is the mathematical proof that KCC's three-component model is the correct and only viable decomposition for congestion control. Any claim that four-component modeling is "more complete" misunderstands the inference problem: more parameters make the problem harder, not richer, when the observation dimension is fixed at 1.
-
----
-
-### Why Formal Model Selection (AIC/BIC) Is Vacuously Here
-
-The four-component model's Fisher Information Matrix has rank 1 < dim(θ) = 4, making the Hessian singular. The likelihood is flat along a 3-dimensional subspace — the maximum likelihood estimate is non-unique, the Laplace approximation integral diverges (det(H) = 0 → ln(0) = −∞), and the χ² asymptotic distribution for the likelihood ratio test does not hold (Wilks' theorem requires full-rank FIM). Consequently, AIC, BIC, DIC, WAIC, and all related information criteria are **mathematically undefined** for the four-component model. Model identifiability must be established before model selection, and since the four-component model is structurally unidentifiable from scalar RTT, no criterion is needed. See Proofs E/E1 for the FIM rank analysis and Self & Liang (1987, _JASA_ 82:605–610) for the degenerate-distribution asymptotics.
-
----
+> The complete mathematical proofs (FIM identifiability, Cramér-Rao bounds, censored-Kalman MMSE optimality, AIC/BIC analysis) have been moved to [Appendix A](#appendix-a-theoretical-proofs) at the end of this document. This section provides a brief summary of the conclusions.
 
 ### Summary of Model Comparison Proofs
 
@@ -369,102 +143,9 @@ The four-component model's Fisher Information Matrix has rank 1 < dim(θ) = 4, m
 | O | Directional update tightens SIGCOMM'18 congestion boundary Δ_lo | Censored-regression analysis of min(0,ν) gate; Tobit-type tightened bounds | Tobin (1958) censored regression, SIGCOMM'18 CC evaluation framework |
 | Thm 6 | Unified ISS dissipation ΔV ≤ −αV + γ‖ω‖² across three-subsystem cascade with dwell-time frequency guarantees | ISS-Lyapunov cascade composition (Dashkovskiy 2007); dwell-time condition via cos² phase analogy | Sontag & Wang (1995) ISS, Jiang & Mareels (1997) small-gain, Liberzon (2003) switched systems |
 | I | KCC's estimation is closed under arbitrary RTT asymmetry with bounded conservative error | Six-part proof: min-extraction immune, three-component closed under summation, BDP inflation conservative, sign preserved, forward/reverse fundamental limit | Algebra of min-extraction, structural closure under partitioned RTT |
-| J | Bounded fairness gap between KCC and loss-based/BBR-family CCAs | Equilibrium analysis of queue dynamics; directional gate prevents winner-takes-all; conservative BDP maintains bounded gap | Conservation law for fair-share (small-gain, ISS) |
+| J | Bounded fairness gap between KCC and loss-based/BBR-family CCAs | Equilibrium analysis of queue dynamics; directional gate prevents winner-takes-all; conservative BDP maintains bounded gap | Conservation law for fair-share (small-gap, ISS) |
 
----
-
-### Proof L: Optimality of the Three-Component Model for Congestion Control
-
-**Theorem (Minimal Complete Signal Model).** The three-component decomposition {T_prop, T_queue, T_noise} is the minimal complete signal model for end-to-end congestion control. Formally:
-
-- (a) It is the unique partition with fewest components such that congestion signal is separable from noise (Proposition 1).
-- (b) It is the unique partition with fewest components such that the posterior FIM is non-singular under behavioral priors (Proposition 2, Proof F).
-- (c) It is the unique partition supporting rate decisions: each component maps to exactly one control action {anchor, signal, ignore} (Proposition 3, Lemma 1).
-- (d) Any RTT decomposition satisfying (a)-(c) must have at least 3 components (Proposition 4).
-
-**Proposition 1 (Necessity of 3 for signal-noise separation).** Let S be any partition of RTT delay components. If |S| = 2, then either (i) signal and noise share a class, (ii) anchor and noise share a class, or (iii) anchor and signal share a class. Proof by exhaustion:
-
-- (i) Signal+noise merged: the Z-score for congestion detection is Z = μ_q / √(Var(T_queue) + Var(T_noise)), strictly smaller than Z_3 = μ_q / √Var(T_queue). Detection power drops by factor Z/Z_3 — more false negatives. No threshold tuning recovers the lost SNR.
-- (ii) Anchor+noise merged: the "anchor" has variance > 0 on a fixed path, destroying stationarity. BDP fluctuates with noise, causing cwnd jitter ∝ √Var(T_noise).
-- (iii) Anchor+signal merged: route changes (ΔT_prop) cannot be distinguished from queue changes (ΔT_queue) — directional-gate logic inapplicable. Kalman estimate drifts with queue.
-
-Therefore |S| ≥ 3.
-
-**Proposition 2 (Necessity of 3 for FIM non-singularity).** Proof E shows the 4-component FIM has rank 1 < 4. Proof E1 shows Bayesian priors cannot salvage. The 3-component model with behavioral priors (Proof F) achieves det(Λ_post) > 0. A 2-component model with priors achieves identifiability but sacrifices signal-noise separation (Proposition 1). Hence 3 is the minimum for BOTH identifiability AND separation.
-
-**Proposition 3 (Three Actions are Exhaustive).** Any congestion control algorithm maps innovation ν_k to a rate adjustment Δrate through exactly three channels: INCREASE (insufficient congestion), DECREASE (congestion detected), or HOLD (noise/uncertainty). The three-component classification is the IMAGE of this control law. Any additional component would map to an already-covered channel, providing zero additional control leverage.
-
-**Proposition 4 (Lower Bound on Component Count).** Proof by contradiction. Assume a decomposition with k < 3 components satisfies (a)-(c). k = 1 is trivial (no separation). k = 2 violates at least one of (a)-(c) by Proposition 1. Therefore k ≥ 3. Combined with Lemma 2d (k ≥ 4 is unidentifiable), k = 3 uniquely.
-
-**Conclusion:** The three-component model is the SMALLEST complete signal model satisfying the three necessary conditions for congestion control inference from scalar RTT. No 2-component model can separate signal from noise; no 4-component model can be identified from scalar observations.
-
----
-
-### Proof M: BBR's Implicit Two-Component Model — Degeneracy and KCC's Generalization
-
-**Theorem (BBR as Degenerate 3-Component).** BBRv1's RTT model $$RTT = RTprop + \eta(t)$$ where $$\eta(t) \geq 0$$ is an implicit 2-component model. It is a degenerate case of the 3-component model in which T_noise has no structural representation — all non-propagation delay is lumped into a single "excess delay" component η(t). KCC's 3-component model is the natural information-theoretic generalization that restores identifiability and enables structural noise rejection.
-
-**Step 1 — BBR's Implicit Model.** BBR estimates RTprop via a sliding-window minimum: $$\widehat{RTprop} = \min_{t \leq T} RTT_{\mathrm{obs}}(t)$$. Under the 3-component model, $$RTT_{\mathrm{obs}} = T_{\mathrm{prop}} + T_{\mathrm{queue}} + T_{\mathrm{noise}}$$. Since $$T_{\mathrm{queue}} \geq 0$$ and T_noise is symmetric-median 0:
-
-$$
-min_{t ≤ T} RTT_obs(t) = T_prop + min_{t ≤ T}(T_queue + T_noise)
-$$
-
-When min(T_queue + T_noise) > 0, RTprop_hat is inflated by Δ = min(T_queue + T_noise) — the CONFLATED excess: part queue, part noise. BBR provides no mechanism to decompose Δ.
-
-**Step 2 — Operational Consequences of the Degeneracy.** BBR's cwnd = pacing_rate · RTprop_hat. With RTprop_hat inflated by Δ, cwnd is inflated by C·Δ:
-
-- If Δ contains T_noise: cwnd inflates by C·E[T_noise_positive_floor] — BBR PAYS FOR NOISE.
-- If Δ contains T_queue_min: cwnd inflates by C·min(T_queue) — the known BBR pathology (Cardwell et al. 2016, §5.3).
-
-BBR addresses neither T_noise nor T_queue in Δ — the windowed minimum is information-theoretically unable to separate them.
-
-**Step 3 — KCC's Three-Component Generalization.** KCC restores identifiability by decomposing η(t) = T_queue + T_noise:
-
-- T_queue: extracted via directional gate. Drives ECN backoff and gain decay.
-- T_noise: extracted via outlier gate + jitter EWMA. Residual enters x_est with attenuation K_ss (conservative downward bias only).
-
-KCC's model is the NATURAL GENERALIZATION of BBR's implicit 2-component model: it takes the single opaque excess-delay term η(t) and decomposes it into the two information-theoretically distinct components that η(t) always physically contained.
-
-**Step 4 — Formal Hierarchy.**
-
-$$
-M_2 = \{RTT = T_{base} + \eta(t)\} \quad (\text{BBR's implicit model})
-$$
-
-$$
-M_3 = \{RTT = T_{prop} + T_{queue} + T_{noise}\} \quad (\text{KCC's model})
-$$
-
-Define projection $$π: M_3 → M_2$$ by $$π(T_{prop}, T_{queue}, T_{noise}) = (T_{prop}, T_{queue} + T_{noise})$$. $$M_2$$ is the IMAGE of $$M_3$$ under $$π$$. The kernel $$ker(π) = {(0, δ, −δ)}$$ has dimension 1 — $$M_2$$ loses exactly 1 degree of freedom (the queue-vs-noise distinction) relative to $$M_3$$.
-
-**Corollary (Blackwell Dominance).** For any loss function L on the congestion control decision space, the minimum Bayes risk: R*(M_3) ≤ R*(M_2). KCC's model is STRICTLY MORE INFORMATIVE than BBR's — the extra component T_noise provides additional observable information without any loss of existing information (Blackwell 1953, Ann. Math. Stat. 24(2):265-272).
-
-**Conclusion:** BBR's 2-component implicit model is the degenerate limit of KCC's 3-component model when T_noise is structurally conflated with T_queue. KCC's explicit separation of T_noise from T_queue is not an arbitrary design choice — it is the information-theoretic completion of BBR's incomplete signal model.
-
----
-
-### The Three-Component Model as an Inference Prior
-
-Congestion control is fundamentally an inference problem: the sender observes only `(RTT, packet_loss)` and must infer the hidden network state `(T_prop, queue_occupancy, bottleneck_capacity, competing_flow_count)`. The three-component model provides the necessary prior structure:
-
-1. **T_prop anchors the control baseline.** All rate/cwnd decisions reference this trusted estimate as the physical lower bound.
-2. **T_queue IS the congestion signal.** Only sustained qdelay growth triggers rate reduction.
-3. **T_noise is structurally isolated.** The outlier gate, directional update, and Kalman R boost ensure noise does not contaminate decisions — the algorithm is structurally numb to T_noise.
-
-The four-component model cannot provide this prior structure because it classifies by physical location (unobservable end-to-end) rather than by behavioral characteristics (observable through statistics). The three-component model is the mathematically rigorous, peer-review-verifiable decomposition for congestion control algorithm design.
-
-### Model Selection
-
-| Task Domain | Correct Model | Mathematical Basis |
-|-------------|--------------|--------------------|
-| Network measurement, device diagnostics, link budget | Four-component | Physical decomposition maps to measurable hardware |
-| **Congestion control algorithm design** | **THREE-COMPONENT** | Only behavioral classification enables end-to-end inference (Proof E) |
-| **RTT signal processing** | **THREE-COMPONENT** | T_noise separation prevents noise-driven cwnd oscillation (Proof D) |
-| **Transport-layer delay estimation** | **THREE-COMPONENT** | T_queue must be structurally excluded from baseline (Proof C) |
-| AQM / active queue management | Both (4-comp queue + 3-comp noise) | Physical queue for dropping; noise concept guides burst tolerance |
-
-The models are not mutually exclusive — they describe the same physical phenomenon at different abstraction levels. But for congestion control specifically, the three-component model is the mathematically correct choice: it is the minimal complete set of behaviorally-distinguishable components that can be operationally separated through end-to-end measurements alone. Any congestion control algorithm that fails to incorporate explicit noise isolation is structurally vulnerable to NI C coalescing, ACK compression, and OS scheduling jitter — all physical phenomena that cause RTT variation without congestion.
+The three-component model {T_prop, T_queue, T_noise} is the unique minimal identifiable decomposition for congestion control. The four-component model is information-theoretically unidentifiable from scalar RTT (FIM rank 1 < dim 4; CRB infinite). The directional update with censored-data Kalman filtering achieves almost-sure convergence to T_prop under the behavioral prior T_prop ≤ min(RTT). See Appendix A for complete proofs.
 
 ## Three-Component RTT Decomposition
 
@@ -4402,6 +4083,333 @@ For most deployments, these parameters cover the primary tuning surface (~10 of 
 | `kcc_jitter_r_scale` | 8000 | R (measurement noise) scaling divisor | Increase to desensitize Kalman to jitter |
 | `kcc_probe_rtt_interval_mode` | 1 | PROBE_RTT interval strategy | Set to 0 to disable periodic probing |
 | `kcc_kf_enable` | 0 | Global Kalman BDP filter | Enable only for single-homed servers |
+
+---
+
+## Appendix A: Theoretical Proofs
+
+### Part I: Design Rationale — Model Identifiability Arguments
+
+> Reading note: This section contains the formal mathematical proofs establishing why the three-component model is the correct architecture. **New readers may skip Parts I–II on first reading** and start with [Part III: Engineering Implementation](#part-iii-engineering-implementation--nonlinear-mechanisms) or the [Troubleshooting Guide](#troubleshooting-guide) for operational understanding. Return here when you need the mathematical justification.
+
+### Why the Three-Component Model IS Correct for Congestion Control — Formal Proofs E/E1/F
+
+The comparison between four-component and three-component models is settled by the Fisher Information matrix, the Cramér-Rao bound, and the necessity of behavioral priors for end-to-end identifiability. These are not opinions — they are mathematical theorems taught in every graduate-level estimation theory course.
+
+---
+
+**Proof E (Fisher Information Singularity — Four-Component Impossibility).**
+
+Let θ = [T_prop, T_trans(t), T_queue(t), T_proc(t)]^T be the four-component state vector at time t. The observation model is:
+
+$$
+z_t = T_prop + T_trans(t) + T_queue(t) + T_proc(t) + w_t    where w_t ~ N(0, σ²)
+$$
+
+Written in vector form: $$z_t = h^T θ_t + w_t$$ where $$h = [1, 1, 1, 1]^T$$ — all four components sum identically to the scalar RTT observation.
+
+**Step 1 — Fisher Information Matrix.** For N i.i.d. observations under Gaussian noise:
+
+$$
+I(θ) = (1/σ²) Σ h h^T = (N/σ²) · H
+$$
+
+where H = h h^T is the 4×4 all-ones matrix:
+
+$$
+H = \begin{bmatrix}
+1 & 1 & 1 & 1 \\
+1 & 1 & 1 & 1 \\
+1 & 1 & 1 & 1 \\
+1 & 1 & 1 & 1
+\end{bmatrix}
+$$
+
+The Fisher Information Matrix has **rank 1** while the parameter space has **dimension 4**. The rank deficiency is 3 — three independent linear combinations of the four parameters cannot be estimated from any number of scalar observations.
+
+**Step 2 — Cramér-Rao Bound.** For any unbiased estimator \hat{θ} of the four-component vector:
+
+$$
+Cov(\hat{θ}) ⪰ I⁻¹(θ)
+$$
+
+Since I(θ) is singular (rank 1 < dimension 4), its inverse does not exist in $R^{4\times4}$. The Cramér-Rao lower bound is infinite in 3 directions of the parameter space — corresponding to the three-dimensional nullspace of H. Specifically, any vector v satisfying $$h^T v = 0$$ yields $$v^T I(θ) v = 0$$, giving $$\mathrm{Var}(v^T \hat{θ}) \geq \infty$$ — meaning those parameter combinations are fundamentally unconstrained by the data.
+
+**Determinant computation:** $$\det(I(θ)) = (N/\sigma^2)^4 \cdot \det(H)$$. Since $$H = h \cdot h^T$$ is a rank-1 matrix with eigenvalues {4, 0, 0, 0}, $$\det(H) = 4 \cdot 0 \cdot 0 \cdot 0 = 0$$. Therefore $$\det(I(θ)) = 0$$ identically, confirming that the Fisher Information Matrix is singular and cannot be inverted — no unbiased estimator of the four-component vector exists.
+
+**Step 3 — Conclusion.** From scalar RTT observations alone, **no consistent estimator of all four components exists**. At most ONE linear combination (the sum itself) is identifiable. The four-component model overparametrizes the observation space by a factor of 4. Any congestion control algorithm that attempts to estimate all four components from end-to-end RTT is attempting to solve an information-theoretically impossible problem.
+
+**Nullspace Characterization (constrained Cramér-Rao).**
+
+The nullspace N(H) = {v ∈ R^4 : h^T v = 0} has dimension 3. A complete basis for the unidentifiable subspace:
+
+$$
+v_1 = [ 1,  0, -1,  0]^T   (T_prop vs T_queue trade-off)
+$$
+
+$$
+v_2 = [ 0,  1, -1,  0]^T   (T_trans vs T_queue trade-off)
+$$
+
+$$
+v_3 = [ 0,  0, -1,  1]^T   (T_queue vs T_proc trade-off)
+$$
+
+Any perturbation δ ∈ span{v_1, v_2, v_3} leaves RTT unchanged: h^T(θ + δ) = h^T θ. Individual components have infinite Cramér-Rao variance: Var(θ̂_i) ≥ [I⁻¹(θ)]_{ii} → ∞.
+
+The Moore-Penrose pseudo-inverse I†(θ) = (σ²/N)·(1/16)·H projects onto the identifiable 1D subspace: any unbiased estimator can recover only the total sum θ_sum (and thus θ_sum/4 = average component), with all four individual components perfectly aliased.
+
+**This is not an opinion.** This is the Cramér-Rao theorem (Rao 1945; Cramér 1946) applied to the RTT observation model. Any estimator claiming to recover four RTT components from end-to-end scalar measurements is making a claim that contradicts a fundamental result of statistical estimation theory.
+
+---
+
+**Proof E1 (Bayesian Priors Cannot Salvage Four-Component Inference).**
+
+**Claim:** Even with Bayesian priors on T_trans and T_proc, the four-component model remains inferentially impossible for congestion control.
+
+**Proof:** The posterior precision matrix is:
+
+$$
+Λ_post = Λ_prior + (N/σ²) · H
+$$
+
+where Λ_prior is the prior precision (inverse covariance) matrix. For physically realistic priors (T_trans ~ constant on fixed path, T_proc ~ constant), Λ_prior has rank_prior ≤ 2 (only T_trans and T_proc have informative priors; T_prop and T_queue are unconstrained).
+
+The rank of Λ_post satisfies:
+
+$$
+rank(Λ_post) ≤ rank(Λ_prior) + rank(H) ≤ 2 + 1 = 3
+$$
+
+In the 4D parameter space, Λ_post remains singular — there exists at least one direction where posterior variance is infinite.
+
+**Precisely:** the degenerate direction v = [1, 0, -1, 0]^T (corresponding to T_prop vs T_queue difference) satisfies H·v = 0 (it is in the nullspace of H). If Λ_prior·v = 0 (the prior provides no constraint on this direction — which is exactly the case when priors are placed only on T_trans and T_proc), then:
+
+$$
+Λ_post · v = 0
+$$
+
+and v is perfectly unobservable. This direction is exactly T_prop vs T_queue — the CC-relevant subspace. Even with perfect prior knowledge of T_trans and T_proc (making them known constants and reducing the model to 2 components implicitly), T_prop and T_queue remain coupled in the scalar observation.
+
+The ONLY way to distinguish T_prop from T_queue is through behavioral priors (T_prop constant on fixed path) combined with directional conditioning — which is exactly what the three-component model provides, and exactly what the four-component model lacks by design (it classifies by location, not behavior).
+
+**Scope Qualification:** This holds for priors constrained to T_trans and T_proc (rank ≤ 2 physical-location priors). If behavioral priors (constant-on-path for T_prop, congestion-correlated for T_queue, zero-mean uncorrelated for noise) are applied to a four-component model, the posterior becomes identifiable but the result is OPERATIONALLY IDENTICAL to the three-component model: T_trans and T_proc collapse to known constants (prior-dominated), and only T_prop and T_queue are actively estimated. The extra components provide zero additional inference power — the four-component model under behavioral priors is just an over-parameterized reformulation of the three-component model, introducing spurious degrees of freedom that the data cannot constrain.
+
+---
+
+**Proof F (Three-Component Identifiability through Behavioral Priors).**
+
+**Claim:** The three-component model is identifiable through behavioral priors, where the four-component model is not.
+
+**Definition of the three-component linear projection:**
+
+$$
+RTT_obs = T_prop* + T_queue(t) + T_noise(t)
+$$
+
+where:
+
+- $$T_prop* = T_prop + E[T_trans] + E[T_proc]$$ — all path-constant terms (the mean of the non-queue physical components)
+- $$T_queue(t) = T_queue_four(t)$$ — the same queue component from the four-component model
+- $$T_noise(t) = (T_trans(t) - E[T_trans]) + (T_proc(t) - E[T_proc]) + w_t$$ — all zero-mean fluctuations including measurement noise
+
+**The Fisher Information matrix** for the three-component model from N observations:
+
+$$
+I_3(θ_3) = (N/σ²) · [1 1 1; 1 1 1; 1 1 1]   (rank 1, dimension 3)
+$$
+
+This also has rank deficiency (rank 1 < 3). However, the three-component model adds **BEHAVIORAL PRIORS** that eliminate the rank deficiency:
+
+__Prior 1 (Constant T_prop_):_* $$Var(T_prop*) ≈ 0$$ on a fixed path.
+
+- T_prop* collapses to a single scalar across all N observations, reducing effective dimension from 3 to 2.
+- The prior precision in this direction is effectively infinite, giving Λ_prior rank = 1.
+- With Λ_prior of rank 1 and I_3 of rank 1, the posterior has effective rank ≤ 2, matching the 2D effective parameter space.
+
+**Prior 2 (Zero-mean T_noise):** $$E[T_noise(t)] = 0$$.
+
+- The Kalman innovation expectation satisfies $$E[ν_k | q_k = 0] = 0$$, providing an unbiased measurement of T_prop* on clean RTT samples.
+
+**Prior 3 (Directional conditioning):** Only $$ν_k < 0$$ samples update T_prop*.
+
+- This breaks the T_queue ↔ T_prop* degeneracy on the clean-sample subspace.
+- When q_k > 0: $$P(ν_k < 0) → 0$$, so queue-contaminated samples are structurally excluded from the estimation of T_prop*.
+
+**Result:** With all three priors, the effective FIM rank is 2 (T_prop* pinned, T_queue and T_noise estimable from C·T_prop bound and jitter statistics). The three-component model is **identifiable** where the four-component model is not — not because fewer components are defined, but because behavioral classification enables valid statistical conditioning that physical-location classification cannot provide.
+
+**Rank verification (Direct Determinant Proof):** Construct Λ_post explicitly. Let α = N/σ². Prior 1 (T_prop\* constant) contributes precision λ₁ > 0 in the e₁ = [1,0,0]^T direction. Priors 2,3 (zero-mean noise, directional conditioning) contribute precision λ₃ > 0 in the e₃ = [0,0,1]^T direction. Thus:
+
+$$
+Λ_prior = diag(λ₁, 0, λ₃),  rank = 2
+$$
+
+$$
+I_3 = α · [1 1 1; 1 1 1; 1 1 1],  rank = 1
+$$
+
+$$
+Λ_post = Λ_prior + I_3
+       = [ λ₁ + α,  α,      α        ]
+         [ α,        α,      α        ]
+         [ α,        α,      λ₃ + α   ]
+$$
+
+Row-reduce to compute the determinant:
+
+$$
+R1 ← R1 - R2:  [ λ₁,  0,  0    ]
+$$
+
+$$
+R3 ← R3 - R2:  [ 0,   0,  λ₃   ]
+$$
+
+$$
+R2 (unchanged): [ α,   α,  α    ]
+$$
+
+Cofactor expansion along R1:
+
+$$
+  det(Λ_post) = λ₁ · det([α, α; 0, λ₃])
+$$
+
+$$
+              = λ₁ · α · λ₃
+$$
+
+$$
+              = (N/σ²) · λ₁ · λ₃
+$$
+
+Since N > 0, σ² > 0, λ₁ > 0, λ₃ > 0: **det(Λ_post) > 0**, so Λ_post is full-rank (rank 3 = dim(θ_3comp)) and all parameters have finite Cramér-Rao variance.
+
+**Derivation of λ₃ from measurable quantities:** The claim λ₃ > 0 from Priors 2 and 3 requires explicit construction. λ₃ is the directional-conditioning precision on T_noise in the e₃ = [0,0,1]^T direction, derived from the empirical variance of directionally-conditioned innovations:
+
+- On clean samples (gate open, innovation accepted): ν_k = z_k − x_k = d_k + η_k. After convergence (d_k → 0): Var(ν_k | clean) = σ² = R.
+- The number of clean samples is N_clean = p_clean · N (total accepted innovations out of N observations).
+- The directional-conditioning precision in the e₃ direction is the information contributed by the censored-innovation structure: λ₃ = N_clean / Var(ν_clean) = p_clean · N / R.
+- Since p_clean > 0 (Proof C, boundary B1), N > 0, R > 0: **λ₃ = p_clean · N / R > 0**.
+- Therefore det(Λ_post) = (N/σ²) · λ₁ · λ₃ = (N/R) · λ₁ · (p_clean · N / R) = λ₁ · p_clean · N² / R² > 0, because all four factors (λ₁, p_clean, N, R) are positive.
+
+Note: rank additivity rank(A+B) = rank(A) + rank(B) is NOT assumed — the determinant is computed directly from the explicit matrix. The factored form det = (N/σ²)·λ₁·λ₃ shows identifiability requires ALL THREE information sources: observations (α), Prior 1 (λ₁), and Priors 2,3 (λ₃). Removing any single source zeroes the determinant, collapsing identifiability — confirming each behavioral prior is necessary, not merely helpful. The three-component model is fully identifiable.
+
+**Bootstrap Defense:** The identifiability proof CAN be staged without circularity:
+
+1. Start with ANY initial estimate x_0 ≥ 0.
+2. The directional gate produces p_clean > 0 for ANY estimate, because:
+   - Independent of the estimate quality, the queue occasionally drains (physical fact — queues are not permanent).
+   - During drain phases, RTT decreases (ΔRTT < 0) and the gate opens.
+   - The fraction of drain-phase rounds is lower-bounded by ρ_util/(1−ρ_util) in M/M/1, or more generally by link utilization.
+3. This guarantees a non-zero rate of gate-open rounds → p_clean > 0.
+4. p_clean > 0 → λ₃ > 0 → det(Λ_post) > 0 → identifiability.
+5. Identifiability → estimator convergence → improved p_clean → faster convergence (virtuous cycle).
+
+The bootstrap depends on the PHYSICAL fact that queues drain, not on estimator quality. The initial convergence is self-amplifying: coarse estimates still yield p_clean > 0, which provides the initial information for the estimator to improve.
+
+This is the mathematical proof that KCC's three-component model is the correct and only viable decomposition for congestion control. Any claim that four-component modeling is "more complete" misunderstands the inference problem: more parameters make the problem harder, not richer, when the observation dimension is fixed at 1.
+
+---
+
+### Why Formal Model Selection (AIC/BIC) Is Vacuously Here
+
+The four-component model's Fisher Information Matrix has rank 1 < dim(θ) = 4, making the Hessian singular. The likelihood is flat along a 3-dimensional subspace — the maximum likelihood estimate is non-unique, the Laplace approximation integral diverges (det(H) = 0 → ln(0) = −∞), and the χ² asymptotic distribution for the likelihood ratio test does not hold (Wilks' theorem requires full-rank FIM). Consequently, AIC, BIC, DIC, WAIC, and all related information criteria are **mathematically undefined** for the four-component model. Model identifiability must be established before model selection, and since the four-component model is structurally unidentifiable from scalar RTT, no criterion is needed. See Proofs E/E1 for the FIM rank analysis and Self & Liang (1987, _JASA_ 82:605–610) for the degenerate-distribution asymptotics.
+
+---
+
+### Proof L: Optimality of the Three-Component Model for Congestion Control
+
+**Theorem (Minimal Complete Signal Model).** The three-component decomposition {T_prop, T_queue, T_noise} is the minimal complete signal model for end-to-end congestion control. Formally:
+
+- (a) It is the unique partition with fewest components such that congestion signal is separable from noise (Proposition 1).
+- (b) It is the unique partition with fewest components such that the posterior FIM is non-singular under behavioral priors (Proposition 2, Proof F).
+- (c) It is the unique partition supporting rate decisions: each component maps to exactly one control action {anchor, signal, ignore} (Proposition 3, Lemma 1).
+- (d) Any RTT decomposition satisfying (a)-(c) must have at least 3 components (Proposition 4).
+
+**Proposition 1 (Necessity of 3 for signal-noise separation).** Let S be any partition of RTT delay components. If |S| = 2, then either (i) signal and noise share a class, (ii) anchor and noise share a class, or (iii) anchor and signal share a class. Proof by exhaustion:
+
+- (i) Signal+noise merged: the Z-score for congestion detection is Z = μ_q / √(Var(T_queue) + Var(T_noise)), strictly smaller than Z_3 = μ_q / √Var(T_queue). Detection power drops by factor Z/Z_3 — more false negatives. No threshold tuning recovers the lost SNR.
+- (ii) Anchor+noise merged: the "anchor" has variance > 0 on a fixed path, destroying stationarity. BDP fluctuates with noise, causing cwnd jitter ∝ √Var(T_noise).
+- (iii) Anchor+signal merged: route changes (ΔT_prop) cannot be distinguished from queue changes (ΔT_queue) — directional-gate logic inapplicable. Kalman estimate drifts with queue.
+
+Therefore |S| ≥ 3.
+
+**Proposition 2 (Necessity of 3 for FIM non-singularity).** Proof E shows the 4-component FIM has rank 1 < 4. Proof E1 shows Bayesian priors cannot salvage. The 3-component model with behavioral priors (Proof F) achieves det(Λ_post) > 0. A 2-component model with priors achieves identifiability but sacrifices signal-noise separation (Proposition 1). Hence 3 is the minimum for BOTH identifiability AND separation.
+
+**Proposition 3 (Three Actions are Exhaustive).** Any congestion control algorithm maps innovation ν_k to a rate adjustment Δrate through exactly three channels: INCREASE (insufficient congestion), DECREASE (congestion detected), or HOLD (noise/uncertainty). The three-component classification is the IMAGE of this control law. Any additional component would map to an already-covered channel, providing zero additional control leverage.
+
+**Proposition 4 (Lower Bound on Component Count).** Proof by contradiction. Assume a decomposition with k < 3 components satisfies (a)-(c). k = 1 is trivial (no separation). k = 2 violates at least one of (a)-(c) by Proposition 1. Therefore k ≥ 3. Combined with Lemma 2d (k ≥ 4 is unidentifiable), k = 3 uniquely.
+
+**Conclusion:** The three-component model is the SMALLEST complete signal model satisfying the three necessary conditions for congestion control inference from scalar RTT. No 2-component model can separate signal from noise; no 4-component model can be identified from scalar observations.
+
+---
+
+### Proof M: BBR's Implicit Two-Component Model — Degeneracy and KCC's Generalization
+
+**Theorem (BBR as Degenerate 3-Component).** BBRv1's RTT model $$RTT = RTprop + \eta(t)$$ where $$\eta(t) \geq 0$$ is an implicit 2-component model. It is a degenerate case of the 3-component model in which T_noise has no structural representation — all non-propagation delay is lumped into a single "excess delay" component η(t). KCC's 3-component model is the natural information-theoretic generalization that restores identifiability and enables structural noise rejection.
+
+**Step 1 — BBR's Implicit Model.** BBR estimates RTprop via a sliding-window minimum: $$\widehat{RTprop} = \min_{t \leq T} RTT_{\mathrm{obs}}(t)$$. Under the 3-component model, $$RTT_{\mathrm{obs}} = T_{\mathrm{prop}} + T_{\mathrm{queue}} + T_{\mathrm{noise}}$$. Since $$T_{\mathrm{queue}} \geq 0$$ and T_noise is symmetric-median 0:
+
+$$
+min_{t ≤ T} RTT_obs(t) = T_prop + min_{t ≤ T}(T_queue + T_noise)
+$$
+
+When min(T_queue + T_noise) > 0, RTprop_hat is inflated by Δ = min(T_queue + T_noise) — the CONFLATED excess: part queue, part noise. BBR provides no mechanism to decompose Δ.
+
+**Step 2 — Operational Consequences of the Degeneracy.** BBR's cwnd = pacing_rate · RTprop_hat. With RTprop_hat inflated by Δ, cwnd is inflated by C·Δ:
+
+- If Δ contains T_noise: cwnd inflates by C·E[T_noise_positive_floor] — BBR PAYS FOR NOISE.
+- If Δ contains T_queue_min: cwnd inflates by C·min(T_queue) — the known BBR pathology (Cardwell et al. 2016, §5.3).
+
+BBR addresses neither T_noise nor T_queue in Δ — the windowed minimum is information-theoretically unable to separate them.
+
+**Step 3 — KCC's Three-Component Generalization.** KCC restores identifiability by decomposing η(t) = T_queue + T_noise:
+
+- T_queue: extracted via directional gate. Drives ECN backoff and gain decay.
+- T_noise: extracted via outlier gate + jitter EWMA. Residual enters x_est with attenuation K_ss (conservative downward bias only).
+
+KCC's model is the NATURAL GENERALIZATION of BBR's implicit 2-component model: it takes the single opaque excess-delay term η(t) and decomposes it into the two information-theoretically distinct components that η(t) always physically contained.
+
+**Step 4 — Formal Hierarchy.**
+
+$$
+M_2 = \{RTT = T_{base} + \eta(t)\} \quad (\text{BBR's implicit model})
+$$
+
+$$
+M_3 = \{RTT = T_{prop} + T_{queue} + T_{noise}\} \quad (\text{KCC's model})
+$$
+
+Define projection $$π: M_3 → M_2$$ by $$π(T_{prop}, T_{queue}, T_{noise}) = (T_{prop}, T_{queue} + T_{noise})$$. $$M_2$$ is the IMAGE of $$M_3$$ under $$π$$. The kernel $$ker(π) = {(0, δ, −δ)}$$ has dimension 1 — $$M_2$$ loses exactly 1 degree of freedom (the queue-vs-noise distinction) relative to $$M_3$$.
+
+**Corollary (Blackwell Dominance).** For any loss function L on the congestion control decision space, the minimum Bayes risk: R*(M_3) ≤ R*(M_2). KCC's model is STRICTLY MORE INFORMATIVE than BBR's — the extra component T_noise provides additional observable information without any loss of existing information (Blackwell 1953, Ann. Math. Stat. 24(2):265-272).
+
+**Conclusion:** BBR's 2-component implicit model is the degenerate limit of KCC's 3-component model when T_noise is structurally conflated with T_queue. KCC's explicit separation of T_noise from T_queue is not an arbitrary design choice — it is the information-theoretic completion of BBR's incomplete signal model.
+
+---
+
+### The Three-Component Model as an Inference Prior
+
+Congestion control is fundamentally an inference problem: the sender observes only `(RTT, packet_loss)` and must infer the hidden network state `(T_prop, queue_occupancy, bottleneck_capacity, competing_flow_count)`. The three-component model provides the necessary prior structure:
+
+1. **T_prop anchors the control baseline.** All rate/cwnd decisions reference this trusted estimate as the physical lower bound.
+2. **T_queue IS the congestion signal.** Only sustained qdelay growth triggers rate reduction.
+3. **T_noise is structurally isolated.** The outlier gate, directional update, and Kalman R boost ensure noise does not contaminate decisions — the algorithm is structurally numb to T_noise.
+
+The four-component model cannot provide this prior structure because it classifies by physical location (unobservable end-to-end) rather than by behavioral characteristics (observable through statistics). The three-component model is the mathematically rigorous, peer-review-verifiable decomposition for congestion control algorithm design.
+
+### Model Selection
+
+| Task Domain | Correct Model | Mathematical Basis |
+|-------------|--------------|--------------------|
+| Network measurement, device diagnostics, link budget | Four-component | Physical decomposition maps to measurable hardware |
+| **Congestion control algorithm design** | **THREE-COMPONENT** | Only behavioral classification enables end-to-end inference (Proof E) |
+| **RTT signal processing** | **THREE-COMPONENT** | T_noise separation prevents noise-driven cwnd oscillation (Proof D) |
+| **Transport-layer delay estimation** | **THREE-COMPONENT** | T_queue must be structurally excluded from baseline (Proof C) |
+| AQM / active queue management | Both (4-comp queue + 3-comp noise) | Physical queue for dropping; noise concept guides burst tolerance |
+
+The models are not mutually exclusive — they describe the same physical phenomenon at different abstraction levels. But for congestion control specifically, the three-component model is the mathematically correct choice: it is the minimal complete set of behaviorally-distinguishable components that can be operationally separated through end-to-end measurements alone. Any congestion control algorithm that fails to incorporate explicit noise isolation is structurally vulnerable to NI C coalescing, ACK compression, and OS scheduling jitter — all physical phenomena that cause RTT variation without congestion.
 
 ---
 
