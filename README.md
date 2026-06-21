@@ -16,6 +16,8 @@ This document blends **mathematical proofs** with **engineering documentation**.
 
 **Critical distinction:** The Part I proofs establish that the three-component model with a directional prior is the **correct architecture**. The Part II proofs establish that the **closed loop** is stable. Neither part claims that every ACK is processed by a textbook-Kalman MMSE-optimal update — the Part III mechanisms (outlier gate, jitter EWMA, drift correction, saturation response) intentionally deviate from linear Kalman assumptions while preserving the ISS boundedness conditions that Theorems 1–6 require.
 
+**New readers:** Start with §[KCC Innovations Beyond BBRv1](#kcc-innovations-beyond-bbrv1) for a practical overview, then §[Part III](#part-iii-engineering-implementation--nonlinear-mechanisms) for how the code works. Return to Parts I–II when you need the mathematical justification. See §[Troubleshooting Guide](#troubleshooting-guide) for operational tuning.
+
 ---
 
 ## RTT Decomposition: Four-Component vs. Three-Component Model
@@ -121,6 +123,8 @@ See the **Reading Guide** (§above) and **Part III: Nonlinear Mechanisms in Impl
 ---
 
 ## Part I: Design Rationale — Model Identifiability Arguments
+
+> **📖 Reading note:** This section contains the formal mathematical proofs establishing why the three-component model is the correct architecture. **New readers may skip Parts I–II on first reading** and start with [Part III: Engineering Implementation](#part-iii-engineering-implementation--nonlinear-mechanisms) or the [Troubleshooting Guide](#troubleshooting-guide) for operational understanding. Return here when you need the mathematical justification.
 
 ### Why the Three-Component Model IS Correct for Congestion Control — Formal Proofs E/E1/F
 
@@ -3511,6 +3515,21 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 
 ## KCC Innovations Beyond BBRv1
 
+### Behavioral Differences from BBRv1 — Summary
+
+| Mechanism | BBRv1 Behavior | KCC Behavior | Impact |
+|-----------|---------------|--------------|--------|
+| **DRAIN exit** | OR-gate (timer expires OR inflight ≤ BDP) | AND-gate + safety timeout (must satisfy both) | Fixes residual queue accumulation under concurrent flows |
+| **PROBE_RTT interval** | Fixed 10 seconds | Dynamic 10–75s based on `p_est`; can be disabled (`kcc_probe_rtt_interval_mode=0`) | Eliminates periodic throughput cliffs |
+| **ECN response** | Per-packet cwnd reduction (like loss) | EWMA proportional backoff (`ecn_ewma`) | Smoother AQM cooperation |
+| **Bandwidth estimate** | Sliding-window maximum only | Sliding-window maximum + LT-BW (long-term stable) | Stable throughput under loss/policing |
+| **RTT estimate** | Windowed `min_rtt` only | Kalman `x_est` with directional gate + windowed `min_rtt` floor | Faster path-change adaptation; T_queue rejection |
+| **Single-flow detection** | None | `alone_on_path` detection via queue-to-RTT ratio | Conservative cwnd when alone; avoids self-inflicted queue |
+| **STARTUP exit** | Indefinite if app-limited | Safety timeout at 64 rounds | Guaranteed exit from STARTUP |
+| **Gain decay** | None | Per-phase confidence-scaled gain reduction via `p_est` | Reduces probing amplitude when filter is confident |
+| **ACK aggregation** | None | Confidence-based cwnd compensation | Prevents stall from TSO-induced ACK thinning |
+| **Global KF** | None | Cross-connection bandwidth sharing (opt-in) | Fair share convergence for multi-flow hosts |
+
 ### Gain Decay
 
 Enabled by the 256-bit bitmap `kcc_cycle_decay_mask[]` for specific PROBE_BW phases. Decay formula (on accepted Kalman sample):
@@ -4195,6 +4214,8 @@ New connections seeded with the shared estimate begin at the dessert-speed pacin
 The Global Kalman BDP filter is based on the author's article _On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel_ (CC BY-SA 4.0):
 <https://blog.csdn.net/liulilittle/article/details/161635652>
 
+> **⚠️ Caveat — Multi-Homed / Anycast Environments:** The Global Kalman Filter operates on a per-host basis. In multi-homed, Anycast, or ECMP deployments where different server instances serve the same destination, each host maintains an independent KF estimate. These estimates may diverge, causing cross-host fairness bias. **Recommendation:** Enable `kcc_kf_enable` only in single-homed deployments where all connections share the same bottleneck path. On multi-homed hosts, leave disabled (the per-connection Kalman filter provides adequate bandwidth estimation independently).
+
 ---
 
 ## Part III: Engineering Implementation — Nonlinear Mechanisms
@@ -4369,6 +4390,55 @@ Together, these mechanisms ensure that KCC's Kalman filter gracefully degrades r
 ---
 
 _KCC v1.0 — independently architected around the three-component RTT decomposition model (RTT_obs = T_prop + T_queue + T_noise), using the Kalman filter (Kalman 1960) for propagation-delay estimation. The outer state machine topology preserves BBRv1 compatibility (Cardwell et al. 2016, ACM Queue) for deployment familiarity. All parameters are derived from physical quantities with formal mathematical proofs in the code header._
+
+---
+
+## Troubleshooting Guide
+
+When KCC does not behave as expected, the diagnostic interface (`/proc/kcc/status`) and these parameter adjustments can resolve most issues.
+
+### Diagnostic Quick-Reference
+
+| Observe in `/proc/kcc/status` | Meaning | Action |
+|-------------------------------|---------|--------|
+| All connections in `STARTUP`, `rtt_cnt` low | New or short-lived connections — normal | Wait 3+ seconds; check back |
+| Some in `STARTUP` with `p_est` = 1000000, `samp` > 100 | Kalman filter saturated, STARTUP timeout should fire at rtt_cnt=64 | Verify module compiled from recent commit; check `rtt_cnt` |
+| `alone=1` on many connections | Single-flow detection active — cwnd is being conservatively clamped | Tune `kcc_alone_confirm_rounds` (default 3) or `kcc_rtt_mode` (default FILTER) |
+| `qdelay` consistently high (> 10% of min_rtt) | Persistent queue buildup | Reduce `kcc_qdelay_cong_bp` (default 2500 bp = 25% RTT) |
+| `jitter` > `min_rtt` | Path noise dominating signal | Increase `kcc_jitter_r_scale` or reduce `kcc_kalman_r_max_boost` |
+| `ecn%` > 5 | AQM actively marking, KCC backoff engaged | Check `kcc_ecn_alpha` (smoothing rate) and `kcc_ecn_thresh_bp` (trigger) |
+| `rej` counter high vs `samp` | Directional gate rejecting most samples — path has persistent queue | Saturation response should fire at pos_skip=64; check p_est |
+
+### Common Tuning Scenarios
+
+| Symptom | Primary Parameter | Rationale |
+|---------|-------------------|-----------|
+| Single-flow throughput below BBR | `kcc_alone_confirm_rounds` (default 3) or `kcc_rtt_mode` (default 1=FILTER) | Single-flow mode bypasses Kalman smoothing bias; set `kcc_rtt_mode=0` (MIN) for most conservative BDP |
+| RTT jitter causing large cwnd swings | Increase `kcc_jitter_r_scale` or decrease `kcc_kalman_r_max_boost` | Reduces Kalman gain sensitivity to noise |
+| Persistent bufferbloat (high qdelay) | Reduce `kcc_qdelay_cong_bp` (default 2500) | Triggers ECN/gain-decay at lower queue thresholds |
+| Slow recovery after path change | Reduce `kcc_kalman_drift_thresh` (default 16) or increase `kcc_kalman_q_boost_mult` | Faster drift detection or stronger Q-reset on path change |
+| PROBE_RTT throughput drops | Set `kcc_probe_rtt_interval_mode=0` or increase `kcc_probe_rtt_max_interval` | Disable or defer the periodic min_rtt probe |
+| ECN over-reaction | Increase `kcc_ecn_alpha` (more smoothing) or increase `kcc_ecn_thresh_bp` | Makes ECN response slower and less sensitive |
+| TSO causing ACK thinning stalls | Increase `kcc_agg_per_ack_decay` sensitivity or reduce `kcc_agg_max_ratio` | Aggression compensation for TSO burst effects |
+
+### Parameter Hierarchy
+
+For most deployments, these parameters cover the primary tuning surface (~10 of 150+):
+
+| Parameter | Default | Purpose | When to Change |
+|-----------|---------|---------|----------------|
+| `kcc_rtt_mode` | 1 (FILTER) | RTT source for BDP | Set to 0 (MIN) for conservative single-flow |
+| `kcc_qdelay_cong_bp` | 2500 (25%) | Queue congestion threshold | Lower for earlier backoff; raise for burst tolerance |
+| `kcc_ecn_thresh_bp` | 500 (5%) | ECN mark-rate trigger | Adjust based on AQM marking aggressiveness |
+| `kcc_kalman_drift_thresh` | 16 | Consecutive rejects for Tier-1 drift | Lower (8) for faster path-change detection |
+| `kcc_startup_max_rtts` | 64 | Max STARTUP rounds | Lower for bursty apps; raise for large-BDP paths |
+| `kcc_kalman_saturation_thresh` | 64 | Consecutive rejects for p_est saturation | Must be < drift_thresh*8; range [16,127] |
+| `kcc_alone_confirm_rounds` | 3 | Rounds to confirm single-flow | Increase for noisier paths |
+| `kcc_jitter_r_scale` | 8000 | R (measurement noise) scaling divisor | Increase to desensitize Kalman to jitter |
+| `kcc_probe_rtt_interval_mode` | 1 | PROBE_RTT interval strategy | Set to 0 to disable periodic probing |
+| `kcc_kf_enable` | 0 | Global Kalman BDP filter | Enable only for single-homed servers |
+
+---
 
 ## References
 
