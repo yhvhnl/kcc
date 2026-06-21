@@ -71,6 +71,27 @@ The two models are **not mutually exclusive**. They describe the same physical R
 
 ---
 
+### A Note on Proofs vs. Implementation
+
+The mathematical proofs in this document (FIM identifiability, Cramér-Rao bounds, censored-Kalman MMSE optimality) establish that the **theoretical model** — the three-component decomposition with a directional prior — is the unique minimal representation that makes congestion control inference well-posed. They show why a standard Kalman filter or a four-component model **cannot** separate T_prop from T_queue, and why the directional rejection of positive innovations is necessary.
+
+However, these proofs operate on an idealized model with assumptions (e.g., Gaussian observation noise, stationary processing noise) that do not hold in real networks. The **engineering implementation** in `tcp_kcc.c` introduces non-linear elements that break the pure Kalman filter's MMSE optimality:
+
+| Mechanism | Non-linearity | Why |
+|-----------|-------------|-----|
+| Outlier gate (Chebyshev) | Hard-threshold rejection | Real RTT noise is heavy-tailed, not Gaussian |
+| Directional update | Censored innovation sign-gate | Physical prior: T_prop never increases with congestion |
+| Jitter EWMA | Exponential smoothing of absolute innovations | Robust scale estimator; replaces Kalman's R (measurement noise) |
+| Two-tier drift correction | Conditional, dampened forced updates | Neyman-Pearson sequential test; not part of the standard Kalman recursion |
+| p_est saturation response | State-cap + covariance-reset | Recovery from filter lock-in; no analogue in linear Kalman theory |
+| Force-accept guard | Periodic bypass of outlier gate | Prevents self-reinforcing rejection lockout; breaks censoring assumption |
+
+**Stability of the implementation is guaranteed by ISS (Input-to-State Stability) cascade theory and Lyapunov analysis (Theorems 1–6), NOT by the Kalman filter's own MMSE optimality.** The closed-loop system is proved Globally Uniformly Asymptotically Stable under dwell-time switching, even though the individual Kalman update is no longer strictly MMSE-optimal.
+
+The proofs should be read as **structural justification** for the design — they explain WHY the three-component model, the directional gate, and the outlier rejection are the correct architectural choices — not as a claim that every ACK is processed by a textbook Kalman filter.
+
+---
+
 ### Mathematical Formalization of the Three-Component Model
 
 **Definition 1 (Equivalence Class Partition).** Let r ∈ ℝ be the end-to-end RTT scalar observation. Define three equivalence classes partitioning the physical delay components by their response to congestion:
@@ -4337,5 +4358,3 @@ _KCC v1.0 — independently architected around the three-component RTT decomposi
 | Google BBR | BBR project page — <https://github.com/google/bbr> |
 | BBRplus | "BBRplus: Adaptive Cycle Randomization, Drain-to-Target, and ACK Aggregation Compensation for BBR Convergence and Stall Prevention" — <https://blog.csdn.net/dog250/article/details/80629551> |
 | IETF 101 | "BBR Congestion Control Work at Google IETF 101 Update" — <https://datatracker.ietf.org/meeting/101/materials/slides-101-iccrg-an-update-on-bbr-work-at-google-00> |
-
-```

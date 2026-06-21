@@ -4569,6 +4569,17 @@
  *   | Three-component necessity | Unique coarsest {anchor,signal,noise} partition | Proof A |
  *   | ACK-FSM observer effect | Discrete-time Lure system + Tsypkin Criterion | Proof G.1 |
  *
+ * NOTE ON PROOF SCOPE: The mathematical proofs (FIM identifiability, Cramér-Rao
+ * bounds, censored-Kalman MMSE optimality) establish the THEORETICAL MODEL —
+ * they prove the three-component decomposition with a directional prior is the
+ * unique minimal representation that makes CC inference well-posed.  The
+ * ENGINEERING IMPLEMENTATION introduces non-linear elements (outlier gate,
+ * jitter EWMA, two-tier drift, p_est saturation response, force-accept guard)
+ * that break the pure Kalman filter's MMSE optimality.  Stability of the
+ * implementation is guaranteed by ISS cascade / Lyapunov theory (Theorems 1-6),
+ * NOT by Kalman's own MMSE optimality.  The proofs are structural justification
+ * for the design, not a claim of strict optimality of every ACK's processing.
+ *
  * PROOF HIERARCHY SUMMARY:
  *
  *   Component Level:  Proof A (completeness), B (T_noise), C (directional),
