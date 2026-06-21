@@ -2240,7 +2240,9 @@ Reordering produces two effects: (a) RTT increase — safely rejected by directi
 
 2. **Early ACK → RTT decrease (mitigated):** Negative innovation passes directional gate. Mitigation: single-sample negative innovations are dampened by `KCC_NEG_INNOV_DAMPEN_SHIFT` (corr/4) — a reordering event causes only 1/4 of the naive x_est displacement. The `neg_innov_cnt` counter requires 4 consecutive dampened negatives before resetting the drift counter (`pos_skip_cnt`), preventing single reordering events from interrupting Tier-1/Tier-2 drift detection.
 
-**Trade-off:** Genuine path improvements converge over ~4 clean samples (4 RTTs) rather than instantaneously. This is an intentional conservatism: BBR's 10-second min_rtt window would take longer to reflect a path improvement, and Copa's delay-based window has similar smoothing. The 4-sample dampening is faster than BBR's windowed min_rtt for sudden path improvements while providing single-sample reordering immunity.
+**Trade-off:** Genuine path improvements converge over ~4 clean samples (4 RTTs best-case; congested or sample-sparse paths may take longer). Unlike BBR's 10-second min_rtt window or Copa's delay-based smoothing, the 4-sample dampening is intentionally faster than periodic windows for sudden path improvements while providing single-sample reordering immunity.
+
+**Note on p_est recovery:** The covariance `p_est` is NOT dampened — it drops at full Kalman gain. This prevents the filter from remaining in an artificially 'uncertain' state during path improvements, which would otherwise trigger conservative mechanisms (PROBE_RTT scheduling, gain decay, ECN backoff). This is a deliberate departure from strict Kalman covariance-scaling consistency, justified by the operational semantics of `p_est` in the KCC framework, where it gates multiple throughput-relevant decisions beyond pure estimation accuracy.
 
 **ISS stability proof (updated):** The dampened negative-innovation update introduces an effective Kalman gain `K_eff = β · K` where `β = 1/4` (2⁻²). The Lyapunov dissipation inequality for the Kalman observer subsystem becomes:
 

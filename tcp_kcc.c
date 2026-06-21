@@ -4993,20 +4993,16 @@
  *   == Critical Missing Boundary Cases (B29-B35) ==
  *   (Adapted from KCC_Rebuttal.md §5.10)
  *
- *   B29. Packet Reordering — False RTT Increase (Handled) and Decrease (Residual Risk).
- *     Two distinct cases: (a) Late delivery -> RTT increase: safely rejected by
- *     directional gate.  (b) Early ACK -> RTT DECREASE: an out-of-order ACK
- *     carries an earlier send timestamp, producing a negative innovation that
- *     PASSES the directional gate, pulling x_est downward.  No single-sample
- *     RTT-only heuristic can reliably distinguish this from a genuine path
- *     improvement — any fixed threshold either rejects valid latency reductions
- *     or permits reordering through.  Defense: the min_rtt sticky window (multiple
- *     samples required to commit a new minimum) provides eventual correction.
- *     Acknowledged limitation: transient x_est underestimation is possible after
- *     reordering events.  Cross-layer signals (DSACK, TCP timestamp consistency)
- *     would be needed for a definitive single-sample defense, but these are not
- *     available through the rate_sample interface.
- *
+ *   B29. Packet Reordering — Handled (RTT increase) and Mitigated (RTT decrease).
+ *     (a) Late delivery -> RTT increase: rejected by directional gate.
+ *     (b) Early ACK -> RTT decrease: dampened by KCC_NEG_INNOV_DAMPEN_SHIFT
+ *     (corr>>2=corr/4).  neg_innov_cnt requires 4 consecutive dampened negatives
+ *     before resetting pos_skip_cnt, preventing single reordering events from
+ *     interrupting drift detection.  p_est is NOT dampened — drops at full
+ *     Kalman gain to avoid lingering conservative mechanisms.
+ *     Limitation: when reorder rate > 1/(1<<SHIFT) = 1/4 per RTT, reordering
+ *     dominates neg_innov_cnt; Tier-2 drift may be delayed.  Without cross-layer
+ *     signals, this boundary is inherent to any single-sample RTT estimator.
  *   B30. ACK Compression/Thinning (Aggressive Coalescing).
  *     Physical model: Some receivers coalesce 4-8 ACKs into a single ACK.
  *     Each observation: z_k = T_prop + q_k/C + T_noise + T_compression(n)
@@ -6239,7 +6235,7 @@ struct kcc_ext {
     u8  qboost_cdwn;                                 /* [K] cooldown counter: min accepted samples between qboost events; prevents runaway resets */
 
     u8  pos_skip_cnt;                                /* [T_noise] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
-    u8  neg_innov_cnt;                               /* [T_prop] consecutive dampened negative innovations; drifts up to (1<<DAMPEN_SHIFT)-1 before resetting pos_skip_cnt; prevents single reordering events from interrupting drift counters */
+    u8  neg_innov_cnt;                               /* [T_prop] consecutive dampened negative innovations; reset threshold = (1<<KCC_NEG_INNOV_DAMPEN_SHIFT)-1; implicitly coupled to dampening factor — if SHIFT changes, threshold adapts automatically via (1U<<SHIFT); see kcc_kalman_update() acceptance path */
     u8  alone_exit_cnt;                              /* [T_noise] consecutive alone_eval failures; exit hysteresis for multi-flow resonance resistance */
 
     struct list_head kcc_node;                                              /* [K] list node in module-global kcc_conn_list for /proc/kcc/status */
@@ -11912,9 +11908,19 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                 else if (drift_tier == KCC_DRIFT_TIER2) {
                     p_reduction >>= KCC_DRIFT_TIER2_SHIFT;  /* Tier-2: match corr/8 correction */
                 }
-                else if (neg_innov_dampened) {
-                    p_reduction >>= KCC_NEG_INNOV_DAMPEN_SHIFT;  /* Neg-innov: match dampened correction */
-                }
+                /* [T_prop] Negative-innovation dampening: x_est correction is scaled
+                 * by KCC_NEG_INNOV_DAMPEN_SHIFT to convert single-sample trust into a
+                 * multi-sample filter.  However, p_est reduction uses the FULL Kalman
+                 * gain (NOT dampened).  Rationale: p_est measures estimation error
+                 * covariance, but PROBE_RTT scheduling, gain decay, and ECN backoff
+                 * interpret it as 'network uncertainty.'  On a genuine path improvement,
+                 * a slowly-dropping p_est would unnecessarily trigger these conservative
+                 * mechanisms, delaying throughput recovery.  By letting p_est drop at
+                 * full speed, the filter signals 'I am converging on correct values'
+                 * immediately, while x_est still converges at 1/4 rate for safety.
+                 * This is a deliberate departure from strict Kalman covariance-scaling
+                 * consistency — justified by the operational semantics of p_est in the
+                 * broader KCC framework. */
                 p_new = (u64)p_pred - p_reduction;
                 ext->p_est = max_t(u32, (u32)p_new, kcc_kalman_p_est_floor_val);
             }
