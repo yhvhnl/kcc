@@ -348,65 +348,7 @@ This is the mathematical proof that KCC's three-component model is the correct a
 
 ### Why Formal Model Selection (AIC/BIC) Is Vacuously Here
 
-Formal model selection criteria such as the Akaike Information Criterion (AIC) and Bayesian Information Criterion (BIC) are sometimes cited as objective methods to choose between the 3-component model and a 4-component model. This subsection proves that AIC/BIC is **mathematically vacuous** for this comparison, because the 4-component model's likelihood is degenerate.
-
-**Definitions:**
-
-$$
-AIC = 2k − 2\ln(\hat{L}) \quad (k = \text{number of identifiable parameters})
-$$
-
-$$
-BIC = k·\ln(n) − 2\ln(\hat{L}) \quad (n = \text{number of observations})
-$$
-
-**For the 3-component model {T_base, T_queue, T_noise}:**
-
-- k₃ = 3 (all three parameters have finite CRB variance; Proof F)
-- L̂₃ = max_θ ℓ(θ | data) is well-defined and finite.
-
-**For the 4-component model {T_prop, T_trans, T_proc, T_queue}:**
-Under a fixed path and fixed rate, T_prop, T_trans, and T_proc are all constants that cannot be resolved from a single scalar RTT measurement. The Fisher Information Matrix (FIM) for the 4-component model has rank(I₄) = 1 < dim(θ₄) = 4. The FIM is singular because the log-likelihood gradient with respect to (T_prop, T_trans, T_proc) lies in a 1-dimensional subspace of R³:
-
-$$
-∂ℓ/∂T_prop = ∂ℓ/∂T_trans = ∂ℓ/∂T_proc = (1/σ²)·(z − Σθⱼ)
-$$
-
-All three gradient components are **identical**, making the effective parameter count k_eff = rank(FIM) = 1, not 4.
-
-Therefore the log-likelihood ℓ(θ₄ | data) is **flat** along the 3-dimensional subspace T_prop + T_trans + T_proc = constant — the maximum L̂₄ is **not unique**. This degeneracy means:
-
-- **AIC is undefined:** k = dim(θ₄) = 4 overcounts; the effective k_eff = 1, but the likelihood's curvature matrix (negative Hessian = FIM) is singular, so the Laplace approximation integral that underlies the BIC derivation diverges.
-- **BIC is undefined:** Same singularity — the 2nd-order Taylor expansion of −ln L posterior has a degenerate Hessian, making the Gaussian integral approximation infinite.
-- Neither criterion can produce a finite, meaningful comparison between degenerate and non-degenerate models. Any attempt to "compute AIC/BIC" for the 4-component model is numerically ill-conditioned and mathematically ill-posed.
-
-**Formal justification (Kass & Raftery 1995, Spiegelhalter et al. 2002):**
-The log marginal likelihood for model M with singular FIM is:
-
-$$
-ln p(data | M₄) = ln ∫ L(θ | data)·π(θ) dθ
-$$
-
-Under the Laplace approximation, when |H| = 0 (singular Hessian = singular FIM), this approximation diverges to +∞ because ln(0) = −∞ — the integral is improper and the Bayesian evidence for M₄ is undefined.
-
-For the 3-component model, by contrast, det(H₃) > 0, so the Laplace approximation is well-defined, and ln p(data | M₃) is finite.
-
-**Conclusion:** Formal model selection (AIC, BIC, DIC, WAIC, etc.) cannot distinguish 3-component from 4-component models because one model's likelihood is degenerate. This mathematically justifies the behavioral prior approach: identifiability must be established **before** model selection, not **through** model selection. Since the 4-component model has singular FIM, the identifiability question is settled a priori — the behavioral priors are not an evasion of formal model selection but a recognition that formal model selection is mathematically vacuous when one candidate model is degenerate.
-
-**References:**
-
-- Akaike, H., "A new look at the statistical model identification," _IEEE Trans. Autom. Control_, 19(6):716-723, 1974.
-- Schwarz, G., "Estimating the dimension of a model," _Ann. Stat._, 6(2):461-464, 1978.
-- Kass, R.E. & Raftery, A.E., "Bayes factors," _J. Am. Stat. Assoc._, 90(430):773-795, 1995.
-- Spiegelhalter, D.J. et al., "Bayesian measures of model complexity and fit," _J. R. Stat. Soc. B_, 64(4):583-639, 2002.
-
-**Supplementary Derivations:**
-
-**(a) Reduced likelihood function (constrained 4-component form).** On a fixed path with fixed BW, T_trans = L/B = α · MSS/rate, where α is a dimensionless serialization factor. Since rate and BW may vary, the constraint T_trans = α · rate⁻¹ does not eliminate the degeneracy — it substitutes one unknown (T_trans) for another (α), still leaving 4 unknowns from scalar RTT: $$z = T_prop + α·MSS/rate + T_proc + T_queue$$. Without independent measurement of α or rate, the FIM still has rank 2 < dim(θ) = 4, and the reduced likelihood ℓ_red remains flat along a 2-dimensional subspace. No constraint on T_trans alone removes the rank deficiency — only behavioral priors that span distinct subspaces (anchor, signal, noise) achieve full rank.
-
-**(b) Likelihood Ratio Test (LRT) impossibility.** The LRT statistic for H₀: M₃ vs H₁: M₄ is $$Λ = 2·(ln L̂₄ − ln L̂₃) ∼ χ²_{k₄−k₃}$$ under Wilks' theorem. However, Wilks' theorem requires both models have full-rank FIM. For M₄, the Hessian H₄ is singular (det(H₄) = 0), so the χ² asymptotic distribution does NOT hold. The limiting distribution is a mixture of χ² and Dirac masses at 0 (Self & Liang, 1987, _JASA_ 82:605–610), making the effective degrees of freedom indeterminate and the test non-calibratable.
-
-**(c) FIM singular value analysis (preferred to AIC/BIC).** When comparing identifiable (M₃) vs degenerate (M₄) models, FIM singular values provide diagnostic information that AIC/BIC cannot. Let σ₁ ≥ σ₂ ≥ σ₃ ≥ σ₄ ≥ 0 be the singular values of I(θ). For M₄: σ₁ > 0, σ₂ = σ₃ = σ₄ = 0, giving condition number κ(I) = ∞ (singular). For M₃: σ₁ ≥ σ₂ ≥ σ₃ > 0, κ(I) finite. The FIM eigenvalue spectrum {4, 0, 0, 0} for M₄ is the definitive fingerprint of an unidentifiable model — it renders all information-criterion comparisons undefined, while simultaneously proving that no criterion is needed: the model is structurally unfit. The singular value ratio σ₁/σ₂ provides a continuous measure of practical identifiability even when formal identifiability holds. Self, S.G. & Liang, K.-Y., _JASA_ 82(398):605–610, 1987.
+The four-component model's Fisher Information Matrix has rank 1 < dim(θ) = 4, making the Hessian singular. The likelihood is flat along a 3-dimensional subspace — the maximum likelihood estimate is non-unique, the Laplace approximation integral diverges (det(H) = 0 → ln(0) = −∞), and the χ² asymptotic distribution for the likelihood ratio test does not hold (Wilks' theorem requires full-rank FIM). Consequently, AIC, BIC, DIC, WAIC, and all related information criteria are **mathematically undefined** for the four-component model. Model identifiability must be established before model selection, and since the four-component model is structurally unidentifiable from scalar RTT, no criterion is needed. See Proofs E/E1 for the FIM rank analysis and Self & Liang (1987, _JASA_ 82:605–610) for the degenerate-distribution asymptotics.
 
 ---
 
@@ -3530,6 +3472,12 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 | **ACK aggregation** | None | Confidence-based cwnd compensation | Prevents stall from TSO-induced ACK thinning |
 | **Global KF** | None | Cross-connection bandwidth sharing (opt-in) | Fair share convergence for multi-flow hosts |
 
+#### Key Difference Details
+
+**DRAIN exit — AND-gate vs OR-gate.** Kernel BBR exits DRAIN when the timeout expires OR inflight drops below BDP (OR-gate). This means concurrent flows can exit DRAIN while residual queue from another flow's PROBE_UP phase remains in the bottleneck buffer. Over successive cycles, unconsumed residual accumulates — after ~10 PROBE_BW cycles, aggregate queue reaches ~3× BDP, triggering loss and throughput collapse. KCC's AND-gate requires both the timer AND the inflight condition, plus a 4-RTT safety timeout. Every flow drains completely before any flow re-enters PROBE_BW, preventing residual accumulation.
+
+**PROBE_RTT decoupling.** Kernel BBR forces a 200ms drain at 4-packet cwnd every 10 seconds regardless of path conditions. On a 10 Gbps datacenter path with 100 μs RTT, this drops throughput from 10 Gbps to ~480 Kbps for 200ms — a 20,000× throughput cliff. KCC's PROBE_RTT interval is dynamically scaled by Kalman confidence: when `p_est` is low (filter converged), the interval extends up to 75 seconds; when `p_est` is high (filter uncertain), the interval shortens to 10 seconds. The mode can be disabled entirely (`kcc_probe_rtt_interval_mode=0`), relying on the Kalman min_rtt tracking instead of periodic forced drains.
+
 ### Gain Decay
 
 Enabled by the 256-bit bitmap `kcc_cycle_decay_mask[]` for specific PROBE_BW phases. Decay formula (on accepted Kalman sample):
@@ -3793,6 +3741,8 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // minimum inflight
 ## Module Parameters
 
 Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_module_params()` (validation + clamping + derived value computation). Array parameter writes trigger `kcc_rebuild_gain_table()`.
+
+> **Parameter constraints:** Several parameters have mandatory inter-parameter relationships enforced at initialization. For example, `kcc_kalman_saturation_thresh < kcc_kalman_drift_thresh × 8` (invariant: saturation response must fire before Tier-2 drift, or the response is perpetually preempted). If you set incompatible values, the module silently clamps them to safe ranges and emits a kernel warning (`dmesg | grep kcc`). Use the defaults or the combinations recommended in the Troubleshooting Guide unless you have a specific reason to deviate.
 
 ### PROBE_RTT Intervals
 
@@ -4153,6 +4103,8 @@ When a new connection is established, the filter's estimate is used to seed:
 
 A defensive floor in `kcc_update_bw` prevents the first few RTTs of low delivery-rate samples from overwriting the injected estimate during STARTUP.  A full-BW guard in `kcc_check_full_bw_reached` prevents the iperf3 control-message exchange from prematurely terminating STARTUP.
 
+> **Caveat — Multi-Homed / Anycast Environments:** The Global Kalman Filter operates on a per-host basis. In multi-homed, Anycast, or ECMP deployments where different server instances serve the same destination, each host maintains an independent KF estimate. These estimates may diverge, causing cross-host fairness bias. **Enable `kcc_kf_enable` only in single-homed deployments** where all connections share the same bottleneck path. On multi-homed hosts, leave disabled — the per-connection Kalman filter provides adequate bandwidth estimation independently.
+
 ### Dessert-Speed Discount Ratio
 
 The effective injection speed is derived from the discount formula:
@@ -4213,8 +4165,6 @@ New connections seeded with the shared estimate begin at the dessert-speed pacin
 
 The Global Kalman BDP filter is based on the author's article _On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel_ (CC BY-SA 4.0):
 <https://blog.csdn.net/liulilittle/article/details/161635652>
-
-> Caveat — Multi-Homed / Anycast Environments: The Global Kalman Filter operates on a per-host basis. In multi-homed, Anycast, or ECMP deployments where different server instances serve the same destination, each host maintains an independent KF estimate. These estimates may diverge, causing cross-host fairness bias. **Recommendation:** Enable `kcc_kf_enable` only in single-homed deployments where all connections share the same bottleneck path. On multi-homed hosts, leave disabled (the per-connection Kalman filter provides adequate bandwidth estimation independently).
 
 ---
 
@@ -4397,6 +4347,21 @@ _KCC v1.0 — independently architected around the three-component RTT decomposi
 
 When KCC does not behave as expected, the diagnostic interface (`/proc/kcc/status`) and these parameter adjustments can resolve most issues.
 
+### Quick Verification
+
+```bash
+# 1. Confirm KCC is the active congestion control algorithm
+sysctl net.ipv4.tcp_congestion_control
+
+# 2. Confirm a specific connection is running KCC (not kernel BBR)
+ss -ti | grep -A 5 "kcc"
+
+# 3. Check Kalman filter health (/proc/kcc/status)
+cat /proc/kcc/status | head -20
+```
+
+If `ext_fail > 0` appears in the status output, some connections are running in degraded mode (no Kalman extension state allocated) — check kernel memory pressure (`dmesg | grep kcc`). If `ext_fail` grows continuously, increase the system's available kernel memory or reduce the number of concurrent KCC connections.
+
 ### Diagnostic Quick-Reference
 
 | Observe in `/proc/kcc/status` | Meaning | Action |
@@ -4442,13 +4407,32 @@ For most deployments, these parameters cover the primary tuning surface (~10 of 
 
 ## References
 
+### Core Theory
+
+| Subject | Reference |
+|---------|-----------|
+| Kalman filter | Kalman, R.E., "A New Approach to Linear Filtering and Prediction Problems," _ASME J. Basic Eng._, 82:35–45, 1960 — <https://doi.org/10.1115/1.3662552> |
+| Cramér-Rao bound | Rao, C.R., "Information and the accuracy attainable in the estimation of statistical parameters," _Bull. Calcutta Math. Soc._, 37:81–91, 1945 |
+| ISS (Input-to-State Stability) | Sontag, E.D. & Wang, Y., "On characterizations of the input-to-state stability property," _Syst. Control Lett._, 24(5):351–359, 1995 — <https://doi.org/10.1016/0167-6911(94)00050-6> |
+| ISS cascade | Jiang, Z.P. & Mareels, I.M.Y., "A small-gain control method for nonlinear cascaded systems with dynamic uncertainties," _IEEE Trans. Autom. Control_, 42(3):292–308, 1997 — <https://doi.org/10.1109/9.557574> |
+| ISS network small-gain | Dashkovskiy, S.N., Rüffer, B.S., & Wirth, F.R., "An ISS small gain theorem for general networks," _Math. Control Signals Syst._, 19(2):93–122, 2007 — <https://doi.org/10.1007/s00498-007-0014-8> |
+| Switched-system dwell-time GAS | Liberzon, D., _Switching in Systems and Control_, Birkhäuser, 2003, Theorem 3.1 |
+| Tsypkin criterion | Tsypkin, Ya.Z., "Frequency criteria for absolute stability of nonlinear sampled-data systems," _Avtomat. i Telemekh._, 25(6):1030–1038, 1964 |
+| Censored regression / Tobit | Tobin, J., "Estimation of relationships for limited dependent variables," _Econometrica_, 26(1):24–36, 1958 |
+| Neyman-Pearson sequential test | Wald, A., _Sequential Analysis_, Wiley, 1947, §5.3 |
+| Singular FIM / degenerate asymptotics | Self, S.G. & Liang, K.-Y., "Asymptotic properties of maximum likelihood estimators and likelihood ratio tests under nonstandard conditions," _JASA_, 82(398):605–610, 1987 |
+| Model selection under singularity | Kass, R.E. & Raftery, A.E., "Bayes factors," _JASA_, 90(430):773–795, 1995 |
+| Lyapunov / convex optimization | Boyd, S. & Vandenberghe, L., _Convex Optimization_, Cambridge University Press, 2004, §7.1 |
+
+### TCP / Congestion Control
+
 | Tag | Citation / Link |
 |-----|----------------|
-| BBR | Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM Queue, Vol. 14 No. 5, 2016 — <https://dl.acm.org/doi/10.1145/3009824> |
-| BBR-S | "BBR-S: A Low-Latency BBR Modification for Fast-Varying Connections", 2021 — <https://ieeexplore.ieee.org/document/9438951> |
-| RBBR | "RBBR: A Receiver-Driven BBR in QUIC for Low-Latency in Cellular Networks", 2022 — <https://ieeexplore.ieee.org/document/9703289> |
-| ERCC | "ERCC: Fine-grained RDMA Congestion Control via Kalman Filter-based Multi-bit ECN Feedback Reconstruction", 2025 — <https://dl.acm.org/doi/10.1145/3769270.3770124> |
-| Linux BBR | Linux kernel BBR reference — <https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c> |
+| BBR | Cardwell et al., "BBR: Congestion-Based Congestion Control," _ACM Queue_, 14(5), 2016 — <https://dl.acm.org/doi/10.1145/3009824> |
+| BBR-S | "BBR-S: A Low-Latency BBR Modification for Fast-Varying Connections," 2021 — <https://ieeexplore.ieee.org/document/9438951> |
+| RBBR | "RBBR: A Receiver-Driven BBR in QUIC for Low-Latency in Cellular Networks," 2022 — <https://ieeexplore.ieee.org/document/9703289> |
+| ERCC | "ERCC: Fine-grained RDMA Congestion Control via Kalman Filter-based Multi-bit ECN Feedback Reconstruction," 2025 — <https://dl.acm.org/doi/10.1145/3769270.3770124> |
+| BBRplus | "BBRplus: Adaptive Cycle Randomization, Drain-to-Target, and ACK Aggregation Compensation," 2019 — <https://blog.csdn.net/dog250/article/details/80629551> |
+| Kernel BBR | Linux kernel BBR implementation — <https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c> |
 | Google BBR | BBR project page — <https://github.com/google/bbr> |
-| BBRplus | "BBRplus: Adaptive Cycle Randomization, Drain-to-Target, and ACK Aggregation Compensation for BBR Convergence and Stall Prevention" — <https://blog.csdn.net/dog250/article/details/80629551> |
-| IETF 101 | "BBR Congestion Control Work at Google IETF 101 Update" — <https://datatracker.ietf.org/meeting/101/materials/slides-101-iccrg-an-update-on-bbr-work-at-google-00> |
+| IETF 101 | "BBR Congestion Control Update," IETF 101 ICCRG — <https://datatracker.ietf.org/meeting/101/materials/slides-101-iccrg-an-update-on-bbr-work-at-google-00> |
