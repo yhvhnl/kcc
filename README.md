@@ -4,6 +4,20 @@ KCC is an independently engineered congestion control algorithm built on the thr
 
 ---
 
+### Reading Guide
+
+This document blends **mathematical proofs** with **engineering documentation**. To avoid confusion, readers should understand the distinction:
+
+| Part | Sections | Purpose | Guarantees |
+|------|----------|---------|------------|
+| **I: Design Rationale** | §Proof A–F, §Three-Component Decomposition, §C.1–C.4 | Prove the three-component model is the unique minimal identifiable decomposition for CC; justify the directional update as censored Kalman | Model identifiability (FIM, CRLB); structural correctness |
+| **II: Stability Proofs** | §Theorem 1–6, §Corollary | Prove the **full closed-loop system** (ACK feedback, Kalman observer, PROBE_BW controller, queue dynamics) is stable | ISS, Lyapunov GUAS, dwell-time GAS, fairness |
+| **III: Engineering Implementation** | §Nonlinear Extensions, §Saturation Recovery, §Boundary Cases B1–B51, §Parameters, §FSM | Document the **actual running code** — nonlinear mechanisms, parameters, state machine, edge cases | Empirically bounded behavior; ISS preconditions maintained |
+
+**Critical distinction:** The Part I proofs establish that the three-component model with a directional prior is the **correct architecture**. The Part II proofs establish that the **closed loop** is stable. Neither part claims that every ACK is processed by a textbook-Kalman MMSE-optimal update — the Part III mechanisms (outlier gate, jitter EWMA, drift correction, saturation response) intentionally deviate from linear Kalman assumptions while preserving the ISS boundedness conditions that Theorems 1–6 require.
+
+---
+
 ## RTT Decomposition: Four-Component vs. Three-Component Model
 
 KCC's core philosophy is that congestion control requires a different RTT decomposition than network measurement. This section rigorously proves why the three-component model is the necessary and sufficient decomposition for congestion control algorithms.
@@ -73,22 +87,7 @@ The two models are **not mutually exclusive**. They describe the same physical R
 
 ### A Note on Proofs vs. Implementation
 
-The mathematical proofs in this document (FIM identifiability, Cramér-Rao bounds, censored-Kalman MMSE optimality) establish that the **theoretical model** — the three-component decomposition with a directional prior — is the unique minimal representation that makes congestion control inference well-posed. They show why a standard Kalman filter or a four-component model **cannot** separate T_prop from T_queue, and why the directional rejection of positive innovations is necessary.
-
-However, these proofs operate on an idealized model with assumptions (e.g., Gaussian observation noise, stationary processing noise) that do not hold in real networks. The **engineering implementation** in `tcp_kcc.c` introduces non-linear elements that break the pure Kalman filter's MMSE optimality:
-
-| Mechanism | Non-linearity | Why |
-|-----------|-------------|-----|
-| Outlier gate (Chebyshev) | Hard-threshold rejection | Real RTT noise is heavy-tailed, not Gaussian |
-| Directional update | Censored innovation sign-gate | Physical prior: T_prop never increases with congestion |
-| Jitter EWMA | Exponential smoothing of absolute innovations | Robust scale estimator; replaces Kalman's R (measurement noise) |
-| Two-tier drift correction | Conditional, dampened forced updates | Neyman-Pearson sequential test; not part of the standard Kalman recursion |
-| p_est saturation response | State-cap + covariance-reset | Recovery from filter lock-in; no analogue in linear Kalman theory |
-| Force-accept guard | Periodic bypass of outlier gate | Prevents self-reinforcing rejection lockout; breaks censoring assumption |
-
-**Stability of the implementation is guaranteed by ISS (Input-to-State Stability) cascade theory and Lyapunov analysis (Theorems 1–6), NOT by the Kalman filter's own MMSE optimality.** The closed-loop system is proved Globally Uniformly Asymptotically Stable under dwell-time switching, even though the individual Kalman update is no longer strictly MMSE-optimal.
-
-The proofs should be read as **structural justification** for the design — they explain WHY the three-component model, the directional gate, and the outlier rejection are the correct architectural choices — not as a claim that every ACK is processed by a textbook Kalman filter.
+See the **Reading Guide** (§above) and **Part III: Nonlinear Mechanisms in Implementation** (§below) for a detailed discussion of the distinction between theoretical model proofs and engineering implementation. In brief: the proofs establish why the three-component directional architecture is correct; implementation stability is guaranteed by ISS theory, not by Kalman MMSE optimality.
 
 ---
 
@@ -118,6 +117,10 @@ The proofs should be read as **structural justification** for the design — the
 **Why 3, Not 4?** The four-component physical model {T_prop, T_trans, T_queue, T_proc} partitions by PHYSICAL LOCATION, creating components that are NOT separable from scalar RTT observations. Proof E below shows the FIM is singular (rank 1 < dim 4) for scalar RTT. In contrast, the three components of the behavioral partition are separated by their response to queue variations — a CRITERION THAT IS TESTABLE from RTT observations alone, via the directional update.
 
 **Why 3, Not 2?** A two-component model {T_base, T_queue} cannot distinguish congestion from noise. The test statistic ∂/∂q would classify all positive RTT variations as queue, including noise spikes — leading to systematically inflated T_prop estimates. The third component T_noise enables structural separation of signal from interference, which is essential for unbiased estimation (Proof A Corollary).
+
+---
+
+## Part I: Design Rationale — Model Identifiability Arguments
 
 ### Why the Three-Component Model IS Correct for Congestion Control — Formal Proofs E/E1/F
 
@@ -1125,7 +1128,9 @@ The claim that KCC "abandons Kalman optimality" confuses the UNCONSTRAINED Kalma
 
 All code in `tcp_kcc.c` is organized around this decomposition. Every function, struct field, and `#define` constant is annotated with `[T_prop]`, `[T_queue]`, `[T_noise]`, or `[K]` (Kalman filter machinery) to identify which component it processes.
 
-## Closed-Loop Control Theory
+---
+
+## Part II: Closed-Loop Stability — ISS Framework
 
 KCC is not a heuristic.  It is a provably stable feedback control system.
 
@@ -4189,6 +4194,25 @@ New connections seeded with the shared estimate begin at the dessert-speed pacin
 
 The Global Kalman BDP filter is based on the author's article _On Kalman Estimation and Engineering Implementation of Global Steady-State Bandwidth in the Linux Kernel_ (CC BY-SA 4.0):
 <https://blog.csdn.net/liulilittle/article/details/161635652>
+
+---
+
+## Part III: Engineering Implementation — Nonlinear Mechanisms
+
+The following mechanisms intentionally deviate from the linear Kalman filter model. Each is justified by physical necessity and individually verified to preserve the ISS boundedness conditions required by Theorems 1–6:
+
+### Nonlinear Extensions in the Running Code
+
+| Mechanism | Deviation from Linear KF | Physical Justification | ISS Precondition Preserved |
+|-----------|--------------------------|------------------------|---------------------------|
+| **Outlier gate** (Chebyshev) | Hard-threshold rejection instead of Kalman's `R` weighting | Real RTT noise is heavy-tailed, not Gaussian. A single TSO-burst spike (40ms) would poison the estimate for 20+ RTTs under pure Gaussian weighting | Jitter EWMA (the gate's scale parameter) is capped at max(min_rtt_us, rtt_sample_max_us_val), ensuring bounded gate threshold → bounded rejection rate → ISS input remains bounded |
+| **Directional update** (sign-gate) | Censored-data Kalman; positive innovations discarded | Physical prior: T_prop never increases with congestion. Accepting T_queue as state innovation would violate the behavioral model | Rejection rate bounded by force-accept guard (1 per 25 RTTs); covariance grows as p_pred + Q on rejects (correct Kalman propagation), capped at p_est_max → bounded uncertainty |
+| **Jitter EWMA** | Replaces Kalman's measurement noise covariance R with an online scale estimator | R must adapt to path conditions (datacenter μs vs satellite ms); offline R tuning is impossible | Explicitly clamped to max(min_rtt_us, rtt_sample_max_us_val) ≤ 500ms; by the three-component model, this is a valid upper bound on T_noise magnitude → ISS input boundedness satisfied |
+| **Two-tier drift correction** | Forced dampened updates violating the directional gate | Neyman-Pearson sequential test: after 16 or 128 consecutive positive rejects, P(H_0) < 10⁻⁹ / 10⁻³⁸. Path has genuinely changed | Correction magnitude is dampened (corr/4, corr/8) and proportional to innovation; covariance reduction is correspondingly scaled → bounded perturbation to ISS subsystem |
+| **p_est saturation response** | State-cap + covariance-reset; no analogue in linear KF | When p_est hits p_est_max and x_est > min_rtt (64 consecutive positive rejects, P < 10⁻²⁰), filter is provably locked | x_est capped at min_rtt_us (physical upper bound on T_prop); p_est reset to p_est_init (re-enters high-gain convergence); one-time bounded correction → ISS cascade recovery |
+| **Force-accept guard** | Periodically bypasses both outlier gate and directional gate (1 per 25 consecutive rejects) | Prevents self-reinforcing lockout where 100% rejection → frozen filter → larger innovations → even more rejection | Acceptance rate bounded (1/25 = 4%); accepted innovation clipped to RTT sample cap → bounded forcing input |
+
+Each of these mechanisms introduces **bounded, measurable perturbations** to the linear Kalman recursion. The ISS cascade (Theorems 5–6) explicitly accommodates bounded perturbation inputs — the dissipation inequality ΔV ≤ −αV + γ‖w‖² holds with the perturbation w comprising cross-traffic, T_noise spikes, and the bounded forcing from these non-linear mechanisms.
 
 ---
 
