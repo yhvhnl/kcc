@@ -2248,7 +2248,7 @@ $$\Delta V_O \leq -(2\beta K - \beta^2 K^2) \cdot V_O + \sigma_O \cdot \|(q/C, \
 
 With `K_ss = 0.39`, the effective decay rate `α_O_eff = 2(0.25·0.39) − (0.25·0.39)² ≈ 0.186` compared to the original `α_O = 0.39`. The small-gain condition `γ_loop = K_eff < 1` is still satisfied (`0.25·0.39 = 0.0975 < 1`). The ISS cascade (Theorems 5–6) holds with the modified decay rate — stability is preserved; convergence is slower by a factor of ~1/β = 4 for the downward direction. See Theorem 5 (§5.7) for the original small-gain derivation.
 
-**Performance trade-off:** When reordering rate < 1/4 per RTT, the dampening imposes no additional performance cost beyond slower path-improvement convergence. Extrmely low-latency-sensitive applications may consider reducing `KCC_NEG_INNOV_DAMPEN_SHIFT` (code constant, not a runtime parameter). On paths with frequent micro-reordering AND persistent congestion, dampened negatives accumulate via `neg_innov_cnt` and may reset `pos_skip_cnt` after 4 consecutive events — a second-order effect statistically negligible at typical reordering rates (<1%).
+**Performance trade-off:** When reordering rate < 1/4 per RTT, the dampening imposes no additional performance cost beyond slower path-improvement convergence. Extremely low-latency-sensitive applications may consider reducing `KCC_NEG_INNOV_DAMPEN_SHIFT` (compile-time constant, requires module rebuild; not a sysctl — lowering it weakens reordering defense). On paths with frequent micro-reordering AND persistent congestion, dampened negatives accumulate via `neg_innov_cnt` and may reset `pos_skip_cnt` after 4 consecutive events — a second-order effect statistically negligible at typical reordering rates (<1%).
 
 #### B30 — ACK Compression/Thinning (Aggressive Coalescing)
 
