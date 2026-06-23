@@ -919,10 +919,16 @@
  *     is the maximum-likelihood estimator of T_prop.  This is a
  *     deterministic functional of the data requiring no model parameters.
  *
- *     Lemma C.2 (Censored Kalman MMSE).  Under the Gaussian noise model
- *     with one-sided constraint, the censored Kalman filter (CKF)
- *     x_hat_k = x_hat_{k-1} + K_k * nu_k * I(nu_k <= 0) is the
- *     minimum mean-square error (MMSE) estimator of T_prop.  It is a
+ *     Lemma C.2 (Censored Kalman Minimum-Variance — subject to truncation bias).
+ *     Under the Gaussian noise model with one-sided constraint, the censored
+ *     Kalman filter (CKF) x_hat_k = x_hat_{k-1} + K_k * nu_k * I(nu_k <= 0) is
+ *     the minimum-variance estimator of T_prop among all estimators satisfying
+ *     the one-sided constraint — i.e., conditionally optimal on accepted samples.
+ *     It is NOT the unconditional MMSE estimator: truncating a normal distribution
+ *     introduces the Mills-ratio bias E[ν | ν<0] = −σ√(2/π) ≠ 0.  KCC's
+ *     implementation does NOT apply a Heckman two-step correction; it applies the
+ *     raw Kalman gain with optional dampening, trading a small downward bias
+ *     (conservative for CC) for implementation simplicity.  The CKF is a
  *     Tobit-type censored regression (Tobin 1958) with selection rule
  *     i_k = 1(z_k < x_hat_k^{-}), censoring from ABOVE.  The
  *     constrained projection x_hat_k^{+} = argmin_{x <= z_k}
@@ -1615,7 +1621,7 @@
  *   Core design rule: T_prop anchors, T_queue signals, T_noise is noise.
  *   The algorithm is structurally sensitive to queue and structurally
  *   numb to noise.  Noise does NOT mean the bottleneck capacity dropped.
- *   KCC never pays for noise.
+ *   KCC structurally isolates T_noise from direct rate and cwnd decisions.
  *
  *   Proof E (Fisher Information Singularity -- Four-Component Impossibility).
  *     Let theta = [T_prop, T_trans(t), T_queue(t), T_proc(t)]^T be the
@@ -1902,7 +1908,7 @@
  *     likelihood is degenerate.  This MATHEMATICALLY JUSTIFIES the behavioral
  *     prior approach: identifiability must be established BEFORE model
  *     selection, not THROUGH model selection.  Since the 4-component model
- *     has singular FIM (Proof E, at ~L1620), the identifiability question is
+ *     has singular FIM (Proof E), the identifiability question is
  *     settled a priori — the behavioral priors are NOT an evasion of formal
  *     model selection, but a recognition that formal model selection is
  *     mathematically vacuous when one candidate model is degenerate.
@@ -2651,9 +2657,10 @@
  *                                             │                               │
  *                                             └── cwnd comp gate blocked     └── cwnd compensation active
  *
- *   [Global Kalman BDP filter (cross-connection)]
- *     - Shared T_prop estimate across all KCC flows to a destination:
- *       eliminates the winner-takes-all unfairness of per-flow min_rtt
+ *   [Global Kalman BDP filter (cross-connection, disabled by default: kcc_kf_enable=0)]
+ *     - When enabled (kcc_kf_enable=1): provides cross-connection shared bandwidth
+ *       estimate (kcc_kf_x, not T_prop) for fair-share init_bw seeding.  Helps
+ *       mitigate the winner-takes-all unfairness of per-flow min_rtt.
  *     - Single-state Kalman with low-pass filtered BW as innovation
  *     - When converged, provides init_bw for new connections, reducing
  *       cold-start ramp
@@ -2668,7 +2675,8 @@
  *   3. model_rtt >= 1 always: both x_est and min_rtt sources produce >= 1
  *   4. ext is non-NULL at call sites where caller checks: callee guards
  *      are structural tautologies (verified by call-graph analysis)
- *   5. rs->delivered is u32 in kernel 5.4+: < 0 check is compile-time false
+ *   5. rs->delivered is s32 (struct rate_sample.delivered is s32 in all kernel
+ *      versions; the KCC < 0 guard is not dead code) — match BBR exactly
  *   6. P+R (Kalman covariance sum) never overflows u64 at fixed-point scales
  *      used (scale >= 64, P/R bounded by sysctl < 2e9)
  *
@@ -2892,14 +2900,17 @@
  *     bounded inputs.  No noise sequence can drive the system unstable.
  *
  *   Corollary (N-flow Fairness).
- *     For N KCC flows sharing a bottleneck with common T_prop, all flows
- *     converge to rate_weight_i = 1/N.  Proof follows from Theorem 1:
- *     the unique equilibrium has all flows at their fair-share BDP, and
- *     Theorem 2 guarantees convergence from any initial condition.  The
- *     directional update (all flows reject T_queue) prevents the
- *     winner-takes-all pathology: no flow can lower its apparent min_rtt
- *     below T_prop by seizing more bandwidth, because queue-induced RTT
- *     increases are structurally excluded from the T_prop estimate.
+ *     For N KCC flows sharing a bottleneck, all flows converge to rate_i = C/N
+ *     regardless of kcc_rtt_mode (FILTER or MIN).  Fairness arises from symmetric
+ *     PROBE_BW gain cycling + directional gate, neither of which involves model_rtt
+ *     (which affects cwnd ceiling, not pacing rate).  Global KF (kcc_kf_enable=1)
+ *     accelerates convergence via shared bandwidth seeding but is not required.
+ *     Proof: bx, pacing_gain, and directional gate are identical in both modes.
+ *     By Fax & Murray (2004) Thm 1, symmetric controllers + symmetric plant →
+ *     symmetric equilibrium.  See README §Fairness.1-§Fairness.5 for full proof.
+ *     phase desynchronisation, not from shared T_prop consensus.  For maximum
+ *     multi-flow fairness under heterogeneous path conditions, set
+ *     kcc_kf_enable=1 to activate the cross-connection Global Kalman BDP filter.
  *
  *     Coupled-Lyapunov proof for multi-flow interaction:
  *
@@ -3328,12 +3339,12 @@
  *         alpha_O = 0.6279 * (1 - 0.379) = 0.6279 * 0.621 = 0.390
  *         sigma_O = 0.39^2 * (1 + 0.66) = 0.1521 * 1.66 = 0.252
  *
- *       At K_ss = 0.93 (adaptive Q=2500):
- *         2*K - K^2 = 0.9951,  2*K*(1-K) = 0.1302
- *         eps = 0.9951 / 0.1302 = 7.64
- *         1/(2*eps) = 0.065
- *         alpha_O = 0.9951 * (1 - 0.065) = 0.9951 * 0.935 = 0.930
- *         sigma_O = 0.93^2 * (1 + 3.82) = 0.8649 * 4.82 = 4.17
+ *       At K_ss = 0.88 (adaptive Q=2500, R=400):
+ *         2*K - K^2 = 0.985,  2*K*(1-K) = 0.216
+ *         eps = 0.985 / 0.216 = 4.56
+ *         1/(2*eps) = 0.110
+ *         alpha_O = 0.985 * (1 - 0.110) = 0.877 = K (as proved: α_O = K)
+ *         sigma_O = 0.877^2 * (1 + 2.28) = 0.769 * 3.28 = 2.52
  *
  *       Note: alpha_O approximately equals K_ss in both cases.
  *       This is exact: alpha_O = (2K-K^2)*(1 - (1-K)/(2-K))
@@ -3770,7 +3781,7 @@
  *     These gains are PHASE-DEPENDENT because both K_k (Kalman gain)
  *     and g (pacing gain) vary with the operational phase:
  *
- *       PROBE Phase (K = K_ag = 0.93, g = g_probe = 1.25):
+ *       PROBE Phase (K = K_ag = 0.88, g = g_probe = 1.25):
  *         - gamma_PO = 0  (directional gate BLOCKS queue-contaminated
  *           innovations — the observer ignores the queue it creates)
  *         - gamma_OP = g_probe = 1.25
@@ -3863,7 +3874,7 @@
  *     with PHASE-DEPENDENT concrete coefficients:
  *       PROBE phase (gate closed):
  *         kappa_P   = 1.0 per round (plant, at q_max = BDP)
- *         kappa_O   = K_ag*(2-K_ag) = 0.93*1.07 = 0.995 (observer, K_ag=0.93)
+ *         kappa_O   = K_ag*(2-K_ag) = 0.88*1.12 = 0.986 (observer, K_ag=0.88)
  *         kappa_C   = N/A (probe: V_C increases temporarily, recovered in drain)
  *         kappa_cross = 0  (gate blocks, loop open)
  *
@@ -3895,12 +3906,12 @@
  *     condition K_ss * g_cruise < 1 is satisfied with margin ~2.7×.
  *
  *     Worst-case evaluation (CRUISE phase, both paths active):
- *       - K_ss = 0.39 (steady-state Kalman gain, adaptive max 0.93)
+ *       - K_ss = 0.39 (steady-state Kalman gain, adaptive max 0.88)
  *       - g_cruise = 0.95 (conservative effective cruise pacing gain)
  *       - kappa_cross = 0.39 * 0.95 = 0.371 < 1
  *     The small-gain condition is satisfied with margin 1/0.371 ≈ 2.7×.
  *     At nominal K_ss=0.39, g_cruise ≤ 1.0 yields kappa_cross ≤ 0.39 ≪ 1.
-     *     Even at worst-case K_ag=0.93 (gate closed, kappa_cross=0), the
+     *     Even at worst-case K_ag=0.88 (gate closed, kappa_cross=0), the
      *     condition holds in every phase by phase-specific gain computation.
  *
  *     The basin of attraction is therefore:
@@ -4064,7 +4075,7 @@
  * queue energy (network state), while V_C = (cwnd−BDP)²/2 measures
  * control error. They share the same state space but represent different
  * physical quantities — queue depth vs control deviation. The weight
- * μ = 1 (line 4128) is chosen so both terms have compatible energy units
+ * μ = 1 (§5.3 composite Lyapunov) is chosen so both terms have compatible energy units
  * (J/bit vs J/cwnd-equivalent), and the ISS inequality holds for the
  * composite with phase-dependent gains: in PROBE, queue builds →
  * V_P dominates; in CRUISE, queue shrinks → V_C dominates. The
@@ -4103,10 +4114,26 @@
  *           Maximum frequency bounded by ACK rate.  ISS gain
  *           γ_P = MSS/C (queue response to packet injection).
  *
- *     DWELL-TIME FREQUENCY GUARANTEES:
+ *     DWELL-TIME FREQUENCY GUARANTEES (ideal 8-RTT cycle model):
  *       f_S1 = 1/RTT > 0 always (positive measurement rate).
  *       g_S2_min = 1/(8·RTT) = f_S1/8 (cycle-periodic update).
  *       T_P = RTT matches the queue dynamics timescale.
+ *
+ *     ENGINEERING NOTE — Drain-Skip and Dwell-Time:
+ *       The Liberzon (2003) switched-system stability theorem requires each
+ *       mode to be active for at least one dwell-time τ_d ≥ 1 RTT.  In the
+ *       production code, the DRAIN phase can be shortened or eliminated by:
+ *       (a) drain-skip (kcc_is_next_cycle_phase converts DRAIN to cruise
+ *           after as little as 1/8 RTT when the Kalman is converged and
+ *           qdelay is negligible); and (b) drain-to-target AND-gate exit
+ *           (may fire in < 1 RTT on fast-draining paths, with a 4-RTT
+ *           safety timeout).  These mechanisms are gated by preconditions
+ *           (p_est < converged, qdelay < clean threshold) that guarantee
+ *           they fire only when no standing queue exists — the skipped
+ *           drain is redundant for stability in those cases.  The ISS
+ *           cascade bound (Theorem 5) covers the drain-skip regime; the
+ *           Liberzon dwell-time argument applies to the worst-case
+ *           (drain-enabled, full 8-phase) path.
  *       The dwell-time condition for the 8-phase PROBE_BW cycle:
  *         Each mode (PROBE/DRAIN/CRUISE) active for ≥ 1 RTT.
  *         Cycle period T_cycle = 8·RTT.  For RTT ∈ [1ms, 1s]:
@@ -4317,7 +4344,7 @@
  *       sup_k P_k ≤ max(P_0, p_ss_dir + Q·max_gap)
  *     where max_gap is the maximum number of consecutive gate-closed
  *     rounds (bounded by drift correction Tiers 1/2 at 16/128).
- *       From 0.39 ≤ K_k ≤ 0.93 (across all operating regimes).
+ *       From 0.39 ≤ K_k ≤ 0.88 (across all operating regimes).
  *       sup_k P_k ≤ 418 + 100·128 = 13218 < 25000 (recal threshold).
  *     Hence P(t) stays below the recalibration threshold under all
  *     realistic operating conditions — divergence is impossible.
@@ -4626,55 +4653,56 @@
  *
  *   This table maps every proof, theorem, and lemma to its location in
  *   both tcp_kcc.c (this file) and README.md for bidirectional verification.
- * Line numbers last synced 2026-06-22.
+ * Line numbers last synced 2026-06-22; due to ongoing edits, search by section
+ * name for the current location (e.g., `/^ \* Proof A/`).
  *
- *   | Proof/Theorem | tcp_kcc.c | README.md § | Summary |
- *   |---------------|-----------|-------------|---------|
- *   | Proof A (Completeness & Minimality) | §Proof A, ~L206 | §Proof A | 3-comp is minimal complete set |
- *   | Proof A Corollary (Why 3 Not 2/4) | §Proof A Corollary, ~L382 | §Proof A Corollary | SVD rank + 2-comp underfits |
- *   | Proof B (T_noise Existence) | §Proof B, ~L857 | §Proof B | T_noise physically distinct + Chebyshev |
- *   | Proof C (Directional Update) | §Proof C, ~L882 | §Proof C | Censored gate separates T_prop from T_queue |
- *   | Lemma C.1 (Running-Minimum MLE) | §Lemma C.1, ~L916 | §Lemma C.1 | Running min = MLE under one-sided noise eps≥0 |
- *   | Lemma C.2 (Censored Kalman MMSE) | §Lemma C.2, ~L922 | §Lemma C.2 | CKF = MMSE under Gaussian with one-sided constraint |
- *   | Proof C.1 (Censored Kalman) | §Proof C.1, ~L962 | §Proof C.1 | Tobit-type formulation + a.s. convergence |
- *   | Proof C.2 (Switching KF + NP) | §Proof C.2, ~L1062 | §Proof C.2 | Two-mode SPRT drift detection |
- *   | Proof C.3 (Truncated KF Optimality) | §Proof C.3, ~L1173 | §Proof C.3 | min(0,·) MMSE-optimal under (A1)-(A3) |
- *   | Proof C.4 (Std KF + Prior = Trunc) | §Proof C.4, ~L1335 | §Proof C.4 | Constrained Kalman w/ T_prop≥0 ⇒ truncated KF |
- *   | Proof D (T_noise Isolation) | §Proof D, ~L1589 | §Proof D | Noise enters only attenuated path |
- *   | Proof E (FIM 4-comp Impossible) | §Proof E, ~L1620 | §Proof E | det(I)=0; CRB infinite |
- *   | Proof E1 (Bayesian Cannot Salvage) | §Proof E1, ~L1670 | §Proof E1 | Lambda_post singular on T_prop vs T_queue |
- *   | Proof F (3-comp Identifiable) | §Proof F, ~L1708 | §Proof F | Behavioral priors -> full rank FIM |
- *   | Proof L (Optimality for CC) | §Proof L, ~L584 | §Proof L | Minimal complete signal model; 2-comp fails; 3 is unique |
- *   | Proof M (BBR Degeneracy) | §Proof M, ~L672 | §Proof M | BBR's 2-comp = degenerate KCC 3-comp; Blackwell dominance |
- *   | Proof K (Clean-Sample Starvation) | §Proof K, ~L767 | §Proof K | Fundamental lower bound on T_prop error |
- *   | Corollary K.1 (Starvation Condition) | §Cor K.1, ~L781 | §Cor K.1 | If T_queue>ε for all samples, BDP inflated |
- *   | Corollary K.2 (Graceful Degradation) | §Cor K.2, ~L806 | §Cor K.2 | KCC 3-mechanism composite bound |
- *   | AIC/BIC (Model Selection Vacuous) | §AIC/BIC, ~L1828 | §AIC/BIC | 4-comp likelihood degenerate; selection undefined |
- *   | Theorem 1 (Lyapunov GUAS) | §Thm 1, ~L2691 | §Thm 1 | V(q,d) cycle-average decreasing; GUAS |
- *   | Theorem 2 (Contraction) | §Thm 2, ~L2774 | §Thm 2 | Exponential error decay |
- *   | Theorem 3 (Small-Gain) | §Thm 3, ~L2849 | §Thm 3 | gamma_loop <= K_ss < 1 |
- *   | Theorem 4 (BIBO) | §Thm 4, ~L2871 | §Thm 4 | Bounded input -> bounded output |
- *   | Theorem 5 (ISS Cascade) | §Thm 5, ~L3155 | §Thm 5 | Full closed-loop GAS |
- *   | Corollary (N-flow Fairness) | §Cor, ~L2894 | §Cor | All flows -> C/N |
- *   | Proof I (RTT Asymmetry) | §Proof I, ~L1531 | §Proof I | Bounded-error analysis under asymmetry |
- *   | Proof G.1 (ACK-FSM Observer) | §G.1, ~L12821 | §G.1 | Discrete-time Lur'e + Tsypkin Criterion |
- *   | Proof J (Competition with CCAs) | §Proof J, ~L3102 | §Proof J | BBR/CUBIC/Reno fairness analysis |
- *   | B1-B16 (Boundary Conditions) | §B1-B16, ~L4679 | §B1-B16 | Exhaustive edge-case proofs |
- *   | B17-B28 (Deployment Boundaries) | §B17-B28, ~L4893 | §B17-B28 | Loss, AQM, policer, bufferbloat |
- *   | B29-B35 (Adversarial Cases) | §B29-B35, ~L5000 | §B29-B35 | Reordering, ACK comp, TSO, PIE, CAKE, ECN, PMTU |
- *   | B36-B43 (Competition/Network) | §B36-B43, ~L5069 | §B36-B43 | BBR, ICMP, NAT, cellular, DOCSIS, VPN, LRO, asymmetry |
- *   | B44-B51 (Host Stack + Physical Limit) | §B44-B51, ~L5170 | §B44-B51 | TS wrap, SACK renege, zwp, keepalive, TLP, RACK, PRR, clean-sample starvation |
- *   | Prop 1 (Positive Innovation Bias) | §Prop 1, ~L4371 | §Prop 1 | E[v_k]=mu_q>=0 violates MMSE |
- *   | Prop 2 (Conditional Optimality) | §Prop 2, ~L4385 | §Prop 2 | E[nu_k|nu_k<0]~0 restores MMSE |
- *   | Prop 3 (Drift Correction = SGD) | §Prop 3, ~L4408 | §Prop 3 | SGD with L(x)=1/2*(z-x)^2 |
- *   | Prop 4 (Conservative BDP Bound) | §Prop 4, ~L4467 | §Prop 4 | BDP_KCC <= BDP_true |
- *   | p_ss Model-Mismatch Detector | §p_ss, ~L4428 | §p_ss | p_est > thresh triggers recal |
- *   | Dual-Estimate Maximin | §Dual, ~L4453 | §Dual | model_rtt = min(x_est, min_rtt) |
- *   | Three Lines of Defense Table | §3Lines, ~L4487 | §3Lines | 2 rank-deficiency perspectives + 1 independent behavioral argument |
- *   | Boundary Expansion Analysis | §BEA, ~L4501 | §BEA | T_trans, observability, Bayesian |
- *   | Proof N (5-Scheme Rebuttal) | §Proof N, ~L2057 | §Proof N | All 5 alternatives = special case or dominated |
- *   | Proof O (SIGCOMM'18 Boundary) | §Proof O, ~L2350 | §Proof O | Δ_lo tightened by directional update |
- *   | Mathematical Guarantees Table | §MGT, ~L4554 | §MGT | 28-row comprehensive proof status |
+ *   | Proof/Theorem | Location | README.md § | Summary |
+ *   |---------------|----------|-------------|---------|
+ *   | Proof A (Completeness & Minimality) | §Proof A | §Proof A | 3-comp is minimal complete set |
+ *   | Proof A Corollary (Why 3 Not 2/4) | §Proof A Corollary | §Proof A Corollary | SVD rank + 2-comp underfits |
+ *   | Proof B (T_noise Existence) | §Proof B | §Proof B | T_noise physically distinct + Chebyshev |
+ *   | Proof C (Directional Update) | §Proof C | §Proof C | Censored gate separates T_prop from T_queue |
+ *   | Lemma C.1 (Running-Minimum MLE) | §Lemma C.1 | §Lemma C.1 | Running min = MLE under one-sided noise eps≥0 |
+ *   | Lemma C.2 (Censored Kalman Min-Var) | §Lemma C.2 | §Lemma C.2 | CKF = conditional min-variance under one-sided constraint |
+ *   | Proof C.1 (Censored Kalman) | §Proof C.1 | §Proof C.1 | Tobit-type formulation + a.s. convergence |
+ *   | Proof C.2 (Switching KF + NP) | §Proof C.2 | §Proof C.2 | Two-mode SPRT drift detection |
+ *   | Proof C.3 (Truncated KF Optimality) | §Proof C.3 | §Proof C.3 | min(0,·) conditional min-variance under (A1)-(A3) |
+ *   | Proof C.4 (Std KF + Prior = Trunc) | §Proof C.4 | §Proof C.4 | Constrained Kalman w/ T_prop≥0 ⇒ truncated KF |
+ *   | Proof D (T_noise Isolation) | §Proof D | §Proof D | Noise enters only attenuated path |
+ *   | Proof E (FIM 4-comp Impossible) | §Proof E | §Proof E | det(I)=0; CRB infinite |
+ *   | Proof E1 (Bayesian Cannot Salvage) | §Proof E1 | §Proof E1 | Lambda_post singular on T_prop vs T_queue |
+ *   | Proof F (3-comp Identifiable) | §Proof F | §Proof F | Behavioral priors -> full rank FIM |
+ *   | Proof L (Optimality for CC) | §Proof L | §Proof L | Minimal complete signal model; 2-comp fails; 3 is unique |
+ *   | Proof M (BBR Degeneracy) | §Proof M | §Proof M | BBR's 2-comp = degenerate KCC 3-comp; Blackwell dominance |
+ *   | Proof K (Clean-Sample Starvation) | §Proof K | §Proof K | Fundamental lower bound on T_prop error |
+ *   | Corollary K.1 (Starvation Condition) | §Cor K.1 | §Cor K.1 | If T_queue>ε for all samples, BDP inflated |
+ *   | Corollary K.2 (Graceful Degradation) | §Cor K.2 | §Cor K.2 | KCC 3-mechanism composite bound |
+ *   | AIC/BIC (Model Selection Vacuous) | §AIC/BIC | §AIC/BIC | 4-comp likelihood degenerate; selection undefined |
+ *   | Theorem 1 (Lyapunov GUAS) | §Thm 1 | §Thm 1 | V(q,d) cycle-average decreasing; GUAS |
+ *   | Theorem 2 (Contraction) | §Thm 2 | §Thm 2 | Exponential error decay |
+ *   | Theorem 3 (Small-Gain) | §Thm 3 | §Thm 3 | gamma_loop <= K_ss < 1 |
+ *   | Theorem 4 (BIBO) | §Thm 4 | §Thm 4 | Bounded input -> bounded output |
+ *   | Theorem 5 (ISS Cascade) | §Thm 5 | §Thm 5 | Full closed-loop GAS |
+ *   | Corollary (N-flow Fairness) | §Cor | §Cor | All flows -> C/N |
+ *   | Proof I (RTT Asymmetry) | §Proof I | §Proof I | Bounded-error analysis under asymmetry |
+ *   | Proof G.1 (ACK-FSM Observer) | §G.1 | §G.1 | Discrete-time Lur'e + Tsypkin Criterion |
+ *   | Proof J (Competition with CCAs) | §Proof J | §Proof J | BBR/CUBIC/Reno fairness analysis |
+ *   | B1-B16 (Boundary Conditions) | §B1-B16 | §B1-B16 | Exhaustive edge-case proofs |
+ *   | B17-B28 (Deployment Boundaries) | §B17-B28 | §B17-B28 | Loss, AQM, policer, bufferbloat |
+ *   | B29-B35 (Adversarial Cases) | §B29-B35 | §B29-B35 | Reordering, ACK comp, TSO, PIE, CAKE, ECN, PMTU |
+ *   | B36-B43 (Competition/Network) | §B36-B43 | §B36-B43 | BBR, ICMP, NAT, cellular, DOCSIS, VPN, LRO, asymmetry |
+ *   | B44-B51 (Host Stack + Physical Limit) | §B44-B51 | §B44-B51 | TS wrap, SACK renege, zwp, keepalive, TLP, RACK, PRR, clean-sample starvation |
+ *   | Prop 1 (Positive Innovation Bias) | §Prop 1 | §Prop 1 | E[v_k]=mu_q>=0 violated |
+ *   | Prop 2 (Conditional Optimality) | §Prop 2 | §Prop 2 | E[nu_k|nu_k<0]~0 restores conditional min-var |
+ *   | Prop 3 (Drift Correction = SGD) | §Prop 3 | §Prop 3 | SGD with L(x)=1/2*(z-x)^2 |
+ *   | Prop 4 (Conservative BDP Bound) | §Prop 4 | §Prop 4 | BDP_KCC <= BDP_true |
+ *   | p_ss Model-Mismatch Detector | §p_ss | §p_ss | p_est > thresh triggers recal |
+ *   | Dual-Estimate Maximin | §Dual | §Dual | model_rtt = min(x_est, min_rtt) |
+ *   | Three Lines of Defense Table | §3Lines | §3Lines | 2 rank-deficiency perspectives + 1 independent behavioral argument |
+ *   | Boundary Expansion Analysis | §BEA | §BEA | T_trans, observability, Bayesian |
+ *   | Proof N (5-Scheme Rebuttal) | §Proof N | §Proof N | All 5 alternatives = special case or dominated |
+ *   | Proof O (SIGCOMM'18 Boundary) | §Proof O | §Proof O | Delta_lo tightened by directional update |
+ *   | Mathematical Guarantees Table | §MGT | §MGT | 28-row comprehensive proof status |
  *
  * BOUNDARY CONDITION PROOFS
  *
@@ -4841,8 +4869,8 @@
  *   Goldreich 2017 "Introduction to Property Testing").
  *
  *   B13. Division by zero protections.
- *     All divisions are guarded: (a) rs->interval_us == 0 → reject
- *     sample; (b) tp->mss_cache == 0 → return TSO minimum; (c)
+ *     All divisions are guarded: (a) rs->interval_us <= 0 || rs->delivered < 0 → reject
+ *     sample (match BBR exactly: interval_us is long/signed, delivered is s32);
  *     gain_den >= 1 is guaranteed by p_pred >= kcc_kalman_p_est_floor_val
  *     (default 10), so no explicit floor is needed;
  *     (d) kalman_scale clamped to [64, 1048576]; (e) kcc_*_den >= 1 (all denominator params
@@ -4864,9 +4892,9 @@
  *     Theorem 4's bounded-output guarantee.
  *
  *   B15. Counter saturation.
- *     (a) sample_cnt: u32, saturated at U32_MAX (line 12182: if
+ *     (a) sample_cnt: u32, saturated at U32_MAX (L12226: if
  *     sample_cnt < U32_MAX).  (b) pos_skip_cnt: u8, saturated at
- *     KCC_POS_SKIP_SATURATION (line 11928).  (c) consec_reject_cnt:
+ *     KCC_POS_SKIP_SATURATION (L11972).  (c) consec_reject_cnt:
  *     u32, saturated implicitly by comparison with max_consec_reject
  *     (25) — never reaches U32_MAX.  (d) rtt_cnt, cycle_idx, lt_rtt_cnt:
  *     all bounded by their bitfield widths or clamp guards.  No
@@ -4884,7 +4912,7 @@
  *     (complete outage): kcc_bw() returns 0 → pacing_rate = 0 →
  *     connection stalls.  Recovery when BW returns — no state
      *     corruption.  (d) BW → ∞ (infinite theoretical): bw_raw capped
- *     at U64_MAX / USEC_PER_SEC before multiplication (line 14045:
+ *     at U64_MAX / USEC_PER_SEC before multiplication (L14152:
  *     bw_raw > U64_MAX / USEC_PER_SEC → bw = U64_MAX).
  *     Why this matters: Ensures the physical bounds assumption (Theorem
  *     5-§2, network plant ISS) is not violated by pathological parameter
@@ -5250,7 +5278,7 @@
  *
  *   B51. Clean-Sample Starvation (Graceful Degradation).
  *     Physical model: Queue never drains → no clean RTT sample → T_prop
-     *     structurally overestimated.  See Proof K (~L767) for full analysis.
+      *     structurally overestimated.  See Proof K for full analysis.
  *     Three independent drain mechanisms bound the error (Theorem K.2):
  *     PROBE_BW DRAIN, PROBE_RTT window, two-tier drift detection.
  *     No KCC code change required — the existing mechanisms handle this.
@@ -5302,6 +5330,7 @@
 #include <linux/inet_diag.h>    /* INET_DIAG_BBRINFO ? enables ss -i to dump KCC state alongside BBR diagnostics; matches kernel BBR's diagnostic interface for tool compatibility */
 #include <linux/win_minmax.h>   /* struct minmax, minmax_running_max ? sliding-window max for bandwidth estimation; KCC retains this directly from kernel BBR's bw filter unchanged */
 #include <linux/math64.h>       /* div_u64, mul_u64_u32_shr ? 64-bit fixed-point helpers for BDP and Kalman arithmetic; kernel BBR relies on the same helpers for the same purpose */
+#include <linux/spinlock.h>     /* DEFINE_SPINLOCK, spin_lock, spin_unlock ? protects global KF (x,P) atomic pair against torn reads; see §Proof I bounded-error justification */
 #include <linux/random.h>       /* prandom_u32_max (pre-6.2) / get_random_u32_below (6.2+) ? uniform random for PROBE_BW cycle-phase start offset randomization (Cardwell et al. 2016 Section 4.3) */
 #include <linux/list.h>         /* LIST_HEAD, list_add, list_del, INIT_LIST_HEAD, list_entry ? /proc/kcc/status per-connection tracking */
 #include <linux/proc_fs.h>      /* proc_create, proc_mkdir, remove_proc_entry ? /proc/kcc/status diagnostic interface */
@@ -6445,7 +6474,7 @@ module_param_cb(kcc_probe_rtt_dyn_max_sec, &kcc_param_ops, &kcc_probe_rtt_dyn_ma
  *   Ensures pacing_win = cwnd_gain * pacing_rate covers BDP + max expected
  *   queue depth from probe-adapt transients.
  * BOUNDS: num [0, 100000], den [1, 100000]; net multiplier clamped at KCC_GAIN_MAX;
- *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (line 8619).
+ *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L8655).
  */
 static int kcc_cwnd_gain_num = 2;                     /* [T_queue] CWND gain numerator for PROBE_BW; 2x BDP default; num/den*BBR_UNIT */
 module_param_cb(kcc_cwnd_gain_num, &kcc_param_ops, &kcc_cwnd_gain_num, 0644); /* [T_queue] sysctl: kcc_cwnd_gain_num */
@@ -6734,7 +6763,7 @@ module_param_cb(kcc_pacing_margin_den, &kcc_param_ops, &kcc_pacing_margin_den, 0
 static int kcc_kalman_p_est_max = 1000000;            /* [K] absolute upper bound on p_est (error covariance); prevents divergence after extreme innovation; KCC-only: kernel BBR has no Kalman covariance; when p_est reaches this ceiling, the filter forces re-convergence; range [1, 100000000], BBR default: N/A */
 module_param_cb(kcc_kalman_p_est_max, &kcc_param_ops, &kcc_kalman_p_est_max, 0644); /* [K] sysctl: /proc/sys/net/kcc/kcc_kalman_p_est_max */
 /*
- * Derivation: at p_est=500 with R=400, the Kalman gain is K=500/900≈0.56 — still correcting by 56% of innovations, too responsive for activating convergence-dependent mechanisms.  The converged gate is NOT a claim of low Kalman gain; it is a synthetic gate ensuring that the Kalman posterior variance has crossed a statistically meaningful threshold relative to measurement noise.  Under the matched-estimator Riccati solution (Q=50000, R=32000), the steady-state posterior is p_ss≈2217 (see recal_p_est_thresh derivation).  The converged gate at 500 is deliberately set BELOW p_ss to ensure that convergence-gated mechanisms (Q-boost, aggressive CDWN, dynamic PROBE_RTT extension) only activate after substantial additional convergence beyond typical steady-state — roughly a 4.4× reduction from p_ss.  At p_est=500 with scale=1024, the 3σ Kalman confidence interval on T_prop is ±√(500) µs = ±22 µs ≈ 0.09% of a typical 25 ms baseline — well within any practical tolerance.  The 500 threshold is derived as: converged_p_est = R / eta where eta ≈ 0.8 is a conservatism factor (eta<1 ensures p_est < R, requiring convergence tighter than measurement noise alone would imply).
+ * Derivation: at p_est=500 with R=400, the Kalman gain is K=500/900≈0.56 — still correcting by 56% of innovations, too responsive for activating convergence-dependent mechanisms.  The converged gate is NOT a claim of low Kalman gain; it is a synthetic gate ensuring that the Kalman posterior variance has crossed a statistically meaningful threshold relative to measurement noise.  Under the matched-estimator Riccati solution (Q=50000, R=32000), the predicted steady-state covariance is p_pred_ss = (Q + sqrt(Q² + 4QR)) / 2 ≈ 72170, and the posterior steady-state covariance is p_post_ss = p_pred_ss * R / (p_pred_ss + R) = 72170 * 32000 / (72170 + 32000) ≈ 22170 (see kcc_kalman_q_est_max / kcc_kalman_r_est_max derivation).  The converged gate at 500 is deliberately set BELOW p_post_ss to ensure that convergence-gated mechanisms (Q-boost, aggressive CDWN, dynamic PROBE_RTT extension) only activate after substantial additional convergence beyond typical steady-state — roughly a 44× reduction from p_post_ss (22170 / 500 ≈ 44).  At p_est=500 with scale=1024, the 3σ Kalman confidence interval on T_prop is ±√(500) µs = ±22 µs ≈ 0.09% of a typical 25 ms baseline — well within any practical tolerance.  The 500 threshold is derived as: converged_p_est = R / eta where eta ≈ 0.8 is a conservatism factor (eta<1 ensures p_est < R, requiring convergence tighter than measurement noise alone would imply).
  */
 static int kcc_kalman_converged_p_est = 500;          /* [K] p_est convergence threshold: when p_est < this value, filter is considered converged; KCC-only; enables qboost, aggressive qdelay backoff, and dynamic PROBE_RTT interval extension; range [1, 1000000], BBR default: N/A */
 module_param_cb(kcc_kalman_converged_p_est, &kcc_param_ops, &kcc_kalman_converged_p_est, 0644); /* [K] sysctl: /proc/sys/net/kcc/kcc_kalman_converged_p_est */
@@ -7261,7 +7290,9 @@ module_param_cb(kcc_kalman_p_est_floor, &kcc_param_ops, &kcc_kalman_p_est_floor,
  * estimate. As K → 0 (p_est → 0), the filter stops updating — "filter death."
  * The floor p_est_floor prevents this. With p_est_floor = 10 and R = 400 (nominal):
  *   K_floor = p_est_floor / (p_est_floor + R) = 10 / (10 + 400) = 10/410 ≈ 0.024.
- * The filter always retains at least 2.4% responsiveness to new information.
+ * At nominal R=400, the filter retains at least 2.4% responsiveness to new information.
+ * At adaptive R_max=32000 (matched-estimator ceiling), K_min = 10/(10+32000) ≈ 0.031%.
+ * The key invariant is K_min > 0 (filter never "dies"), not any specific percentage.
  * At K = 0.024, the time constant for a step change is τ = 1/K ≈ 42 RTTs;
  * 5τ (99% convergence) ≈ 208 RTTs. This is intentionally slow — the Q-boost
  * mechanism (p_est reset to p_est_init) handles fast path changes. The floor
@@ -7414,7 +7445,7 @@ module_param_cb(kcc_alone_exit_thresh, &kcc_param_ops, &kcc_alone_exit_thresh, 0
  * PHYSICS: Fixed-point scaling factor converting physical RTT (µs) to filter-internal integer units.
  * UNITS: Dimensionless multiplier; x_est ∈ [scale, U32_MAX] in scaled units.
  * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision; scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (README.md L1885-1886).
- * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (tcp_kcc.c L8474-L8475).
+ * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (tcp_kcc.c L8511).
  */
 static int kcc_kalman_scale = 1024;                       /* [K] Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [K] sysctl: kcc_kalman_scale */
@@ -8297,6 +8328,7 @@ static atomic64_t kcc_kf_x = ATOMIC64_INIT(0);          /* global available BW e
 static atomic64_t kcc_kf_P = ATOMIC64_INIT(0);          /* error covariance (initial uncertainty) */
 static atomic64_t kcc_kf_x_steady = ATOMIC64_INIT(0);   /* steady-mode peak floor: monotonic max (BW_UNIT) */
 static atomic_t kcc_kf_active = ATOMIC_INIT(0);         /* 1 = filter has been seeded (cold-start guard) */
+static DEFINE_SPINLOCK(kcc_kf_lock);                    /* protects atomic (x,P) pair from torn reads/writes; see Proof I §RTT Asymmetry for bounded-error justification */
 
 /* ---- /proc/kcc/status diagnostic counters --------------------------
  * kcc_ext_alloc_fail_cnt -- Monotonic count of kzalloc failures for
@@ -8477,7 +8509,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Enforce: scale^2 > p_est_max (prevents overflow in innov^2/scale^2 division).
      * Without this cross-validation, an operator could independently set
      * p_est_max > scale^2, violating the arithmetic invariant documented at
-     * line 7416 and creating a latent u64 overflow risk. */
+     * L7451 (scale^2 > max(Q,R,P) prevents overflow in innov^2/scale^2 division) and creating a latent u64 overflow risk. */
     kcc_kalman_p_est_max = min_t(int, kcc_kalman_p_est_max,
         (int)(((u64)kcc_kalman_scale * (u64)kcc_kalman_scale) - 1));
 
@@ -8633,7 +8665,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Cycle length and full-BW threshold */
     kcc_probe_bw_cycle_len_val = (u32)kcc_probe_bw_cycle_len;  /* cache clamped PROBE_BW cycle length */
     kcc_full_bw_thresh_val = (u32)(((u64)(kcc_full_bw_thresh_num) << BBR_SCALE) / (u32)kcc_full_bw_thresh_den); /* num/den * BBR_UNIT */
-    kcc_full_bw_cnt_val = (u32)kcc_full_bw_cnt;                                  /* full-BW round count (already clamped to [1,3] at line 8406, fits 2-bit field) */
+    kcc_full_bw_cnt_val = (u32)kcc_full_bw_cnt;                                  /* full-BW round count (already clamped to [1,3] at L8442, fits 2-bit field) */
 
     /* Kalman clamped scalars (Kalman 1960) */
     kcc_kalman_p_est_max_val = (u32)kcc_kalman_p_est_max;  /* cache clamped p_est maximum value */
@@ -9705,11 +9737,11 @@ static void kcc_update_ecn_ewma(struct sock* sk, const struct rate_sample* rs,  
     }
 
     cur_ce = tp->delivered_ce;                                           /* [T_queue] read cumulative CE count */
-    if (rs->delivered <= 0) {
-        return;                                                          /* [T_queue] no data or invalid sample */
+    if (rs->delivered <= 0 || rs->losses < 0) {
+        return;                                                          /* [T_queue] no data, invalid sample, or negative losses */
     }
 
-    total_u64 = (u64)rs->delivered + rs->losses;                         /* [T_queue] total pkts in interval */
+    total_u64 = (u64)rs->delivered + (u32)rs->losses;                    /* [T_queue] total pkts in interval; losses guarded >=0, safe to cast */
     ce_delta = cur_ce - ext->last_delivered_ce;                          /* [T_queue] new CE marks since last */
     ext->last_delivered_ce = cur_ce;                                     /* [T_queue] update CE tracker */
 
@@ -10470,7 +10502,7 @@ static bool kcc_is_next_cycle_phase(struct sock* sk,                    /* [T_qu
         u32 max_bw = kcc_max_bw(sk);                                      /* [T_queue] max BW for inflight target */
         u32 inet_edt = kcc_packets_in_net_at_edt(sk, rs->prior_in_flight, etd_bw);  /* [T_queue] inflight at EDT */
         return is_full_length &&                                          /* [T_queue] RTT elapsed AND */
-            (rs->losses ||                                                /* [T_queue] loss occurred OR */
+            (rs->losses > 0 ||                                             /* [T_queue] actual loss occurred (losses is signed int; >0 guards against negative) */
                 inet_edt >=                                                /* [T_queue] inflight at EDT >= */
                 kcc_inflight(sk, max_bw, kcc->pacing_gain, ext) ||        /* [T_queue] target inflight */
                 (kcc_probe_bw_up_limit_val &&                             /* [T_queue] up-limit enabled AND */
@@ -10906,7 +10938,7 @@ static void kcc_lt_bw_sampling(struct sock* sk, const struct rate_sample* rs)   
 
     /* ---- Mode B: Not active; trigger on loss ---- */
     if (!kcc->lt_is_sampling) {
-        if (!rs->losses) {
+        if (rs->losses <= 0) {                                           /* wait for first loss; losses is int: <=0 catches zero and negative invalid */
             return;                                                                                        /* wait for first loss */
         }
 
@@ -11032,13 +11064,15 @@ static void kcc_update_bw(struct sock* sk, const struct rate_sample* rs)        
     kcc->round_start = 0;                                                                                 /* clear round start flag */
 
     /* Validate rate sample -- match BBR exactly (bbr_update_bw:765).
-     * BBR rejects when delivered < 0 (negative, delivered is s32) OR interval_us == 0
-     * (zero interval; interval_us is u32, negative impossible).
+     * BBR rejects when delivered < 0 (negative, delivered is s32) OR interval_us <= 0
+     * (zero or negative interval; interval_us is u32 on kernels >=5.4, long on older
+     * kernels — <= 0 covers both without depending on the kernel's type definition).
      * Zero delivered IS valid: the ACK carries no new data but may still cross a
      * round boundary.  Skipping zero-delivered ACKs would delay round counting and
-     * full_bw detection.  interval_us == 0 catches zero-duration intervals that
-     * would otherwise corrupt BW computation (division by zero). */
-    if (unlikely(rs->interval_us == 0)) {
+     * full_bw detection.  delivered < 0 catches kernel-injected invalid rate samples
+     * (e.g., no prior_mstamp → delivered = -1), preventing garbage BW from polluting
+     * max_bw via sign-extension in the (u64) cast at L11107. */
+    if (unlikely(rs->delivered < 0 || rs->interval_us <= 0)) {
         return;
     }
 
@@ -11372,7 +11406,7 @@ static void kcc_check_probe_rtt_done(struct sock* sk)                           
     }
 
     kcc->min_rtt_stamp = tcp_jiffies32;                                                        /* fresh min_rtt obtained */
-    tp->snd_cwnd = max(tp->snd_cwnd, kcc->prior_cwnd);                        /* restore cwnd to pre-probe level */
+    kcc_tcp_snd_cwnd_set(tp, max(kcc_tcp_snd_cwnd(tp), kcc->prior_cwnd));      /* restore cwnd to pre-probe level, WRITE_ONCE via wrapper */
 
     kcc_reset_mode(sk);                                                                            /* transition to PROBE_BW */
 }
@@ -11598,13 +11632,15 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
      * by decaying agg_r_scaled toward min_mult, preventing Kalman
      * filter oscillation from abrupt R changes.
      *
-     * NOTE: Confidence evaluation runs BEFORE kcc_update_model in kcc_main,
-     * so agg_confidence read here reflects the current ACK's evaluation.
-     * The Kalman R scale now updates synchronously with detection. */
+     * NOTE: Confidence evaluation runs AFTER kcc_update_model in kcc_main
+     * (step 2 vs step 1), so agg_confidence at this point reflects the
+     * PREVIOUS ACK's evaluation.  The 1-ACK lag is absorbed by the
+     * multi-round confirm/exit hysteresis of kcc_alone_on_path_eval. */
      /* [T_noise] Reserved: ACK aggregation confidence-based Kalman R scaling ---- */
-     /* ext->agg_confidence is always 0 (kcc_agg_factor_weight_val == 0),
-      * so the full dynamic R-scaling block is dormant.  Activate by publishing
-      * kcc_agg_factor_weight_val from the raw parameter value. */
+     /* kcc_agg_factor_weight_val is now published (> 0 by clamp at L8773),
+      * so agg_confidence is no longer always 0 — confidence scoring is live.
+      * The dynamic R-scaling block below can be activated by wiring the
+      * confidence state into the Kalman measurement noise computation. */
       /* [T_noise] end of aggregation R scaling reserved block */
 
     /* [K] Core Kalman update (Kalman 1960) ---- */
@@ -11676,8 +11712,9 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
             }
         }
         /* [K] Prediction step: p_pred = p_est + Q (Kalman 1960) ---- */
-        /* p_est <= 100M clamped, q <= 100k clamped, sum <= 100.1M << U32_MAX */
-        p_pred = min_t(u32, ext->p_est + q, kcc_kalman_p_est_max_val);                                               /* [K] p_pred = min(p_est+Q, p_est_max) */
+        /* p_est <= 100M clamped, q <= 100k clamped, sum <= 100.1M << U32_MAX.
+         * Use u64 cast to guarantee no wrap if operator raises p_est_max beyond design bounds. */
+        p_pred = min_t(u32, (u64)ext->p_est + q, kcc_kalman_p_est_max_val);                                               /* [K] p_pred = min(p_est+Q, p_est_max) */
         /* [T_noise] Outlier rejection (Kalman 1960) ---- */
         /*
          * [T_noise] Dynamic threshold = max(outlier_ms * 1000 * scale,
@@ -11761,7 +11798,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         gain_num = p_pred;                                                                                                                         /* [K] numerator = predicted covariance */
 
         /* [K] gain_den = p_pred + r.  With clamped params, p_pred <= 100M and r <= 100M,
-         * so p_pred + r <= 200M << U32_MAX.  No overflow guard needed.
+         * so p_pred + r <= 200M << U32_MAX — no overflow in u32.
          * gain_den >= 1 is guaranteed by p_pred >= p_est_floor >= 1 (r may be 0). */
         gain_den = p_pred + r;                                                                                                                  /* [K] denominator = p_pred + meas noise */
         drift_tier = 0;                                                              /* reset: will be set to 1 (Tier-1) or 2 (Tier-2) if drift fires below */
@@ -11839,10 +11876,14 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                  * is NOT dampened — it passes at full Kalman gain. */
                 correction = (innovation >= 0) ? (s64)min_t(u64, corr_abs, KCC_S64_MAX) : -(s64)min_t(u64, corr_abs, KCC_S64_MAX);
                 if (innovation < 0) {
-                    /* Dampen via arithmetic right shift on potentially-negative s64.
-                     * All Linux-supported ABIs define >> on signed as arithmetic
-                     * (sign-extending), which preserves the sign and floors toward
-                     * negative infinity — the intended conservative damping. */
+                    /* Dampen negative-innovation updates via arithmetic right shift.
+                     * The C standard §6.5.7 ¶5 leaves right-shift on negative signed
+                     * values as implementation-defined; however, all Linux-supported
+                     * ABIs (x86_64, ARM64, RISC-V) define >> on signed as arithmetic
+                     * (sign-extending, floor toward -∞).  This is the intended
+                     * conservative damping: e.g., -7 >> 2 = -2 (more damped) vs
+                     * -7 / 4 = -1 (truncation toward zero, less conservative).
+                     * The dampen shift is clamped to [0,4] so the magnitude is bounded. */
                     correction >>= kcc_neg_innov_dampen_shift_val;            /* dampen single-sample downward updates */
                     neg_innov_dampened = true;                                        /* scale covariance reduction to match */
                 }
@@ -12225,7 +12266,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
             /* [T_noise] Innov^2: guard against overflow with extreme configs (scale up to 1M, RTT up to 10s).
              * Cap abs_innov at 3e9 before squaring to keep innov^2 within u64 range.
              * NOTE: abs_innov is MUTATED below; corr_abs was already computed from the
-             * original uncapped value at line ~11827.  Any future code referencing abs_innov
+              * original uncapped value at L11654.  Any future code referencing abs_innov
              * after this point receives the capped value. */
             if (abs_innov > KCC_KALMAN_INNOV_SQ_CAP) {
                 abs_innov = KCC_KALMAN_INNOV_SQ_CAP;
@@ -12337,11 +12378,20 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
     struct tcp_sock* tp = tcp_sk(sk);                                                   /* TCP socket state */
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                     /* KCC congestion control state */
     bool filter_expired;                                                                  /* whether PROBE_RTT filter window has expired */
+    bool min_fall_cnt_incr_this_ack = false;                                               /* mutual-exclusion guard: prevents path A + path B both incrementing fast_fall_cnt in a single ACK */
 
     u32 now, rtt_clamped;
 
     now = tcp_jiffies32;                                                                    /* cache volatile jiffies for entire function */
-    rtt_clamped = rs->rtt_us;
+    /* Reject invalid RTT samples: rs->rtt_us is long (signed in struct rate_sample).
+     * The kernel injects rtt_us = -1 when no valid RTT measurement is available
+     * (e.g., prior_mstamp unset, SACK-only ACK with no timestamp).  Passing -1 into
+     * the u32 min_rtt pipeline would sign-extend to ~4.29e9 µs ≈ 4295 s, poisoning
+     * min_rtt_us and the Kalman filter.  Match BBR's bbr_update_min_rtt guard exactly. */
+    if (rs->rtt_us < 0) {
+        return;
+    }
+    rtt_clamped = (u32)rs->rtt_us;
     /*
      * PROBE_RTT entry guard: filter_expired determines whether the
      * 10-second min_rtt filter window has elapsed since the last
@@ -12431,6 +12481,7 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
             }
             else {
                 kcc->min_rtt_fast_fall_cnt = min_t(u32, kcc->min_rtt_fast_fall_cnt + 1, KCC_BITFIELD_2BIT_MAX); /* saturate at 2-bit field max */
+                min_fall_cnt_incr_this_ack = true;                                                               /* guard: prevent Kalman path B from also incrementing this ACK */
                 if (kcc->min_rtt_fast_fall_cnt >= kcc_minrtt_fast_fall_cnt_val) {
                     kcc->min_rtt_us = rtt_clamped;                                                                     /* commit the drop */
                     kcc->min_rtt_fast_fall_cnt = 0;                                                                      /* reset counter */
@@ -12465,14 +12516,24 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
      * Guard ratio default: 90% -> SRTT < 90% of min_rtt triggers override.
      * Apply to min_rtt_us regardless of Kalman state -- SRTT below
      * min_rtt means our estimate is stale in all cases.
+     *
+     * PHYSICAL FLOOR: srtt_us is shifted BEFORE comparison to prevent
+     * the pathological case where srtt_us ∈ [1, 7] produces srtt_us>>3 == 0,
+     * causing 0 < min_rtt * 0.9 (always true for min_rtt >= 1), which
+     * erroneously replaces a valid min_rtt_us with the 1 µs floor.  By
+     * flooring the shifted SRTT at KCC_RTT_MIN_FLOOR_US (= 1 µs, the
+     * kernel's clock granularity) before comparison, the guard fires only
+     * when SRTT/8 is genuinely and meaningfully below min_rtt_us, not
+     * when SRTT is merely below 8 µs (sub-granularity noise).
      */
-    if (
-        tp->srtt_us && kcc->min_rtt_us &&                                                                                                                /* SRTT + min_rtt valid */
-        (tp->srtt_us >> KCC_SRTT_SHIFT) < (u64)kcc->min_rtt_us *                                             /* SRTT/8 < min_rtt * ratio */
-        kcc_minrtt_srtt_guard_num_val / kcc_minrtt_srtt_guard_den_val) {
-        kcc->min_rtt_us = tp->srtt_us >> KCC_SRTT_SHIFT; /* override with smoothed RTT */
-        kcc->min_rtt_us = max_t(u32, kcc->min_rtt_us, KCC_RTT_MIN_FLOOR_US);
-        kcc->min_rtt_stamp = now;                                                                                          /* refresh stamp */
+    if (tp->srtt_us && kcc->min_rtt_us) {
+        u32 srtt_shifted = max_t(u32, tp->srtt_us >> KCC_SRTT_SHIFT, KCC_RTT_MIN_FLOOR_US);
+
+        if (srtt_shifted < (u64)kcc->min_rtt_us *
+            kcc_minrtt_srtt_guard_num_val / kcc_minrtt_srtt_guard_den_val) {
+            kcc->min_rtt_us = srtt_shifted;  /* override with floored smoothed RTT */
+            kcc->min_rtt_stamp = now;         /* refresh stamp */
+        }
     }
 
     /* ---- PROBE_RTT entry (Cardwell et al. 2016, with Kalman decoupling) ---- */
@@ -12586,6 +12647,14 @@ skip_probe_rtt:
      * evidence from both sources and commits when the threshold is
      * reached.  Default threshold = 3 consecutive confirming rounds.
      *
+     * Mutual-exclusion constraint: min_fall_cnt_incr_this_ack ensures
+     * that when sticky-fall (path A) has already incremented the counter
+     * on this ACK, the Kalman pull-down (path B) skips its increment.
+     * Without this guard, a single ACK can increment the counter twice
+     * (0→1 from path A, then 1→2 from path B), reducing the effective
+     * confirmation threshold from 3 rounds to ~2 ACKs and undermining
+     * the multi-round confirmation design.
+     *
      * Update min_rtt_stamp so the next PROBE_RTT entry is governed
      * by the normal filter_expired window (10s or dynamic interval),
      * not by the age of a pre-takeover stamp.  This prevents premature
@@ -12597,7 +12666,7 @@ skip_probe_rtt:
     if (ext && ext->x_est && ext->sample_cnt >= kcc_kalman_min_samples_val &&                                                                  /* Kalman converged */
         kcc->mode != KCC_PROBE_RTT) {
         u32 krtt = (u32)(ext->x_est >> kcc_kalman_scale_shift_val);                                                                        /* Kalman RTT estimate */
-        if (krtt < kcc->min_rtt_us) {
+        if (!min_fall_cnt_incr_this_ack && krtt < kcc->min_rtt_us) {                                  /* guard + Kalman pull-down: skip if sticky-fall already incremented this ACK */
             kcc->min_rtt_fast_fall_cnt = min_t(u32,                                                                                                                 /* saturating increment */
                 kcc->min_rtt_fast_fall_cnt + 1, KCC_BITFIELD_2BIT_MAX);                                                                                               /* 2-bit ceiling = 3 */
             if (kcc->min_rtt_fast_fall_cnt >= (u32)kcc_minrtt_fast_fall_cnt_val) {
@@ -12682,7 +12751,10 @@ static void kcc_update_ack_aggregation(struct sock* sk,                         
         return;
     }
 
-    if (rs->acked_sacked == 0 || rs->interval_us == 0) {
+    /* Reject invalid rate samples: no data ACKed, or kernel-injected invalid sample
+     * (delivered < 0: s32, kernel sets -1 when prior_mstamp is unavailable;
+     * interval_us <= 0: catch zero and negative of the signed long type). */
+    if (rs->acked_sacked == 0 || rs->delivered < 0 || rs->interval_us <= 0) {
         return;
     }
 
@@ -12832,7 +12904,7 @@ static u32 kcc_ack_aggregation_cwnd(struct sock* sk, struct kcc_ext* ext, u32 bw
  *   observation → pacing_rate → ...) is the FULL closed-loop system formed
  *   by the cascade S_2 o S_1 connected to P.  Global asymptotic stability
  *   of the full closed loop is established separately in Theorem 5
- *   (ISS Cascade with Switched-Regime Controller, at ~L3155).
+ *   (ISS Cascade with Switched-Regime Controller; search §Theorem 5).
  *
  *   Decomposition summary:
  *     ┌───────────────────────── FULL CLOSED LOOP ─────────────────────────┐
@@ -12998,7 +13070,7 @@ static u32 kcc_measure_ack_aggregation(struct sock* sk, const struct rate_sample
     u32 expected_acked, extra;                                       /* expected segments; excess beyond expectation */
     u32 cur_bw;                                                      /* current bandwidth estimate in BW_UNIT */
 
-    if (!ext || rs->interval_us == 0) {
+    if (!ext || rs->delivered < 0 || rs->interval_us <= 0) {
         return 0;
     }
 
@@ -13377,6 +13449,11 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,    /
         kcc->pacing_gain = BBR_UNIT;                                  /* pacing at neutral gain (1.0x) */
         kcc->cwnd_gain = BBR_UNIT;                                    /* cwnd at neutral gain to minimise inflight */
         break;                                                        /* exit PROBE_RTT case */
+    default:                                                            /* defensive fallback for unknown/uninitialized mode */
+        kcc->pacing_gain = BBR_UNIT;                                  /* safe default: neutral gain */
+        kcc->cwnd_gain = BBR_UNIT;                                    /* safe default: neutral gain */
+        WARN_ONCE(1, "KCC: unknown mode %u, using neutral gain\n", kcc->mode);
+        break;
     }
 
     /* Re-evaluate single-flow hypothesis test after all stats are fresh */
@@ -13540,8 +13617,8 @@ static u64 kcc_kf_compute_R(u64 z, u32 pct)                          /* compute 
  */
 static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW sample into global Kalman filter */
 {
-    u64 P = atomic64_read(&kcc_kf_P);                                  /* load current error covariance P from global state */
-    u64 x = atomic64_read(&kcc_kf_x);                                  /* load current state estimate x from global state */
+    u64 P;                                                             /* error covariance (loaded under kcc_kf_lock) */
+    u64 x;                                                             /* state estimate (loaded under kcc_kf_lock) */
     u64 R;                                                             /* measurement noise variance */
     u32 shift = 0;                                                     /* bit-shift accumulator for overflow rescaling */
     u64 Pcopy, Rcopy, xcopy, zcopy, denom;                             /* local copies for rescaling; common denominator for Kalman update */
@@ -13553,15 +13630,40 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
 
     R = kcc_kf_compute_R(z, r_pct);                                    /* compute measurement noise variance from sample magnitude */
 
+    /* Atomic pair read: spin_lock ensures (x,P) are from the same Kalman cycle,
+     * preventing a torn pair (x_new, P_old) that would break the K = P/(P+R)
+     * invariant.  Without this lock, a concurrent writer could update x but
+     * not yet P (or vice versa), giving the reader a garbage gain term.
+     * The lock is narrow (two reads + unlock), and kcc_kf_enable defaults to 0
+     * so this path is cold unless the operator explicitly enables the global KF. */
+    spin_lock(&kcc_kf_lock);
+    P = atomic64_read(&kcc_kf_P);                                      /* load current error covariance P from global state */
+    x = atomic64_read(&kcc_kf_x);                                      /* load current state estimate x from global state */
+    spin_unlock(&kcc_kf_lock);
+
     /* Predict step: P = P + Q  (random-walk process noise) */
     P += (1ULL << kcc_kf_q_shift_val);                                 /* add process noise Q = 2^q_shift to covariance */
 
-    /* First sample: seed the filter (cold start) */
+    /* First sample: seed the filter (cold start).
+     * Double-check under lock to prevent a race where two CPUs both see
+     * kcc_kf_active == 0, both compute R, and one overwrites the other's
+     * seed.  The lock serialises seeding; the losing CPU falls through
+     * to the normal update path with its sample as the first measurement. */
     if (unlikely(!atomic_read(&kcc_kf_active))) {
-        atomic64_set(&kcc_kf_x, z);                                    /* seed state estimate with first sample value */
-        atomic64_set(&kcc_kf_P, max(R, 1ULL));                         /* seed error covariance with R (minimum 1) */
-        atomic_set(&kcc_kf_active, 1);                                 /* mark global Kalman filter as active */
-        return z;                                                      /* return the seed value as estimate */
+        spin_lock(&kcc_kf_lock);
+        if (!atomic_read(&kcc_kf_active)) {                            /* re-check under lock: won the seed race */
+            atomic64_set(&kcc_kf_x, z);                                /* seed state estimate with first sample value */
+            atomic64_set(&kcc_kf_P, max(R, 1ULL));                     /* seed error covariance with R (minimum 1) */
+            spin_unlock(&kcc_kf_lock);
+            atomic_set(&kcc_kf_active, 1);                             /* mark global Kalman filter as active */
+            return z;                                                  /* return the seed value as estimate */
+        }
+        spin_unlock(&kcc_kf_lock);                                     /* lost the seed race: re-load under lock and fall through */
+        spin_lock(&kcc_kf_lock);
+        P = atomic64_read(&kcc_kf_P);                                  /* load winner's P */
+        x = atomic64_read(&kcc_kf_x);                                  /* load winner's x */
+        spin_unlock(&kcc_kf_lock);
+        P += (1ULL << kcc_kf_q_shift_val);                             /* re-apply predict step Q to winner's posterior P */
     }
 
     if (check) {
@@ -13615,8 +13717,15 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
     }
 
     if (x > 0) {
+        /* Atomic pair write: publish (x,P) together under kcc_kf_lock so that
+         * concurrent readers always see a consistent pair from the same Kalman
+         * cycle.  A reader between two unguarded atomic64_set calls would see
+         * (x_new, P_old) or (x_old, P_new), breaking the K = P/(P+R) invariant
+         * and potentially corrupting the reader's update computation. */
+        spin_lock(&kcc_kf_lock);
         atomic64_set(&kcc_kf_x, x);                                    /* publish updated state estimate to global state */
         atomic64_set(&kcc_kf_P, P);                                    /* publish updated covariance to global state */
+        spin_unlock(&kcc_kf_lock);
 
         if (kcc_kf_steady_mode_val) {
             u64 old_steady;                                            /* local variable for cmpxchg loop */
@@ -13645,7 +13754,7 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
  * for a conservative initial pacing rate that doesn't overshoot the
  * global fair-share bottleneck.
  *
- * SLOW-RECOVERY DYNAMICS: When `init_bw < local_bw` (line 13683), the
+ * SLOW-RECOVERY DYNAMICS: When `init_bw < local_bw` (line 13790), the
  * global KF estimate is rejected and the connection bootstraps from its
  * own cwnd-derived rate.  If many short-lived connections in a low-rate
  * regime depress the global KF, new connections will reject the depressed
@@ -13929,7 +14038,7 @@ KCC_KFUNC void kcc_init(struct sock* sk)                               /* per-co
                 u32 lo = max_t(u32, tp->snd_cwnd, TCP_INIT_CWND);              /* floor: kernel's existing cwnd or TCP_INIT_CWND */
                 u32 init_cwnd = kcc_bdp(sk, (u32)init_bw, BBR_UNIT, NULL);      /* compute BDP at neutral gain */
                 init_cwnd = clamp_t(u32, init_cwnd, lo, KCC_KF_CWND_SEGS_MAX);  /* clamp between floor and absolute maximum */
-                tp->snd_cwnd = init_cwnd;                                /* seed congestion window with KF-guided BDP [K] */
+                kcc_tcp_snd_cwnd_set(tp, init_cwnd);                          /* seed congestion window with KF-guided BDP [K], WRITE_ONCE via wrapper */
             }
             kcc->has_seen_rtt = 1;                                       /* mark that bandwidth has been seen (bypasses RTT bootstrap) */
         }
@@ -14224,7 +14333,7 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_probe_rtt_long_rtt_us",   .data = &kcc_probe_rtt_long_rtt_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10M us] long-RTT threshold; default 20,000us */
     /* LT BW parameters */
     {.procname = "kcc_lt_intvl_min_rtts",       .data = &kcc_lt_intvl_min_rtts,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..127 RTTs] LT BW min sampling interval; default 4 */
-    {.procname = "kcc_lt_intvl_max_mult",       .data = &kcc_lt_intvl_max_mult,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..32] LT BW timeout = mult*min_rtts; default 4 */
+    {.procname = "kcc_lt_intvl_max_mult",       .data = &kcc_lt_intvl_max_mult,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [2..32] LT BW timeout = mult*min_rtts; default 4; lower bound 2 prevents timeout==min_rtts (stale/sync edge) */
     {.procname = "kcc_lt_loss_thresh",          .data = &kcc_lt_loss_thresh,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] LT BW min loss ratio (BBR_UNIT); 25=9.8% */
     {.procname = "kcc_lt_bw_ratio_num",         .data = &kcc_lt_bw_ratio_num,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k] LT BW relative tolerance numerator; default 1 */
     {.procname = "kcc_lt_bw_ratio_den",         .data = &kcc_lt_bw_ratio_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] LT BW relative tolerance denominator; default 8 (12.5%) */
@@ -14584,6 +14693,9 @@ static int __init kcc_register(void)                                            
     int ret = -ENOMEM, i;                                                    /* return code (default ENOMEM); loop counter */
 
     BUILD_BUG_ON(sizeof(struct kcc) > ICSK_CA_PRIV_SIZE);                                                                       /* compile-time size check */
+
+    /* Invariant: KCC_GAIN_SLOTS must fit the :8 cycle_idx bitfield (8 bits = max 256). */
+    BUILD_BUG_ON(KCC_GAIN_SLOTS > 1 << 8);
 
     for (i = 0; i < KCC_GAIN_SLOTS; i++) {
         kcc_gain_num[i] = dfl_num[i % KCC_DEFAULT_GAIN_CYCLE_LEN];                /* fill gain numerator with repeating BBRv1 pattern */

@@ -8,11 +8,11 @@ KCC is an independently engineered congestion control algorithm built on the thr
 
 This document blends **mathematical proofs** with **engineering documentation**. To avoid confusion, readers should understand the distinction:
 
-| Part | Line Range | Sections | Purpose | Guarantees |
-|------|------------|----------|---------|------------|
-| **I: Design Rationale** | ~L125–763 | §Proof A–F, §Three-Component Decomposition, §C.1–C.4 | Prove the three-component model is the unique minimal identifiable decomposition for CC; justify the directional update as censored Kalman | Model identifiability (FIM, CRLB); structural correctness |
-| **II: Stability Proofs** | ~L764–4019 | §Theorem 1–6, §Corollary | Prove the **full closed-loop system** (ACK feedback, Kalman observer, PROBE_BW controller, queue dynamics) is stable | ISS, Lyapunov GUAS, dwell-time GAS, fairness |
-| **III: Engineering Implementation** | ~L4020–8363 | §Nonlinear Extensions, §Saturation Recovery, §Boundary Cases B1–B51, §Parameters, §FSM | Document the **actual running code** — nonlinear mechanisms, parameters, state machine, edge cases | Empirically bounded behavior; ISS preconditions maintained |
+| Part | Sections | Purpose | Guarantees |
+|------|----------|---------|------------|
+| **I: Design Rationale** | §Proof A–F, §Three-Component Decomposition, §C.1–C.4 | Prove the three-component model is the unique minimal identifiable decomposition for CC; justify the directional update as censored Kalman | Model identifiability (FIM, CRLB); structural correctness |
+| **II: Stability Proofs** | §Theorem 1–6, §Corollary | Prove the **full closed-loop system** (ACK feedback, Kalman observer, PROBE_BW controller, queue dynamics) is stable | ISS, Lyapunov GUAS, dwell-time GAS, fairness |
+| **III: Engineering Implementation** | §Nonlinear Extensions, §Saturation Recovery, §Boundary Cases B1–B51, §Parameters, §FSM | Document the **actual running code** — nonlinear mechanisms, parameters, state machine, edge cases | Empirically bounded behavior; ISS preconditions maintained |
 
 **Critical distinction:** The Part I proofs establish that the three-component model with a directional prior is the **correct architecture**. The Part II proofs establish that the **closed loop** is stable. Neither part claims that every ACK is processed by a textbook-Kalman MMSE-optimal update — the Part III mechanisms (outlier gate, jitter EWMA, drift correction, saturation response) intentionally deviate from linear Kalman assumptions while preserving the ISS boundedness conditions that Theorems 1–6 require.
 
@@ -138,7 +138,7 @@ See the **Reading Guide** (§above) and **Part III: Nonlinear Mechanisms in Impl
 | M | BBR's implicit 2-component model is a degenerate case of KCC's 3-component | Projection π: M_3 → M_2; kernel dimension 1; Blackwell information dominance | Blackwell (1953), comparison of experiments |
 | K | Three independent drain mechanisms bound T_prop error under worst-case perpetual congestion | Composite bound: PROBE_RTT drain (200ms at cwnd_min=4 MSS), drift correction virtual drop, smart recalibration | Fisher Information rank analysis (Cover & Thomas 2006), Kalman convergence |
 | C1 | If T_queue(k) > ε for all samples, T_prop overestimate ≥ ε causing BDP inflation | Algebraic consequence of T_prop+T_queue singularity; min-extraction error bound | Cramér-Rao bound with singular FIM |
-| C2 | KCC limits starvation error via three mechanisms with composite bound ≤ 1 + 13.5× at 10Gbps/10ms | Integration of PROBE_RTT drain volume, drift correction tier thresholds, recalibration timeout | Lindley's equation for queue dynamics |
+| C2 | KCC limits starvation error via three mechanisms with composite bound ≤ 11× at 10Gbps/10ms | Integration of PROBE_RTT drain volume, drift correction tier thresholds, recalibration timeout | Lindley's equation for queue dynamics |
 | N | All five alternative approaches are special cases of or strictly dominated by KCC's 3-component model | Proof by case analysis (Timely, Copa, PCC, Remy, Sprout); structural comparison via information-theoretic privation | Blackwell (1953) comparison of experiments, Cramér-Rao bound |
 | O | Directional update tightens SIGCOMM'18 congestion boundary Δ_lo | Censored-regression analysis of min(0,ν) gate; Tobit-type tightened bounds | Tobin (1958) censored regression, SIGCOMM'18 CC evaluation framework |
 | Thm 6 | Unified ISS dissipation ΔV ≤ −αV + γ‖ω‖² across three-subsystem cascade with dwell-time frequency guarantees | ISS-Lyapunov cascade composition (Dashkovskiy 2007); dwell-time condition via cos² phase analogy | Sontag & Wang (1995) ISS, Jiang & Mareels (1997) small-gain, Liberzon (2003) switched systems |
@@ -161,7 +161,7 @@ $$
 | **T_queue** | Queueing delay | Buffer occupancy / C. Varies continuously with congestion. **The ONLY RTT component carrying genuine congestion information.** | Actionable signal. Drives ECN backoff, gain decay, agg safety gating. Must NEVER update the T_prop baseline. |
 | **T_noise** | Interference | NIC coalescing, OS jitter, ACK compression, wireless L2 retransmission, malicious delay injection. **Carries ZERO congestion information.** | Structurally isolated. Rejected by outlier gate, suppressed by directional update, diluted by Kalman R boost when jitter is high. |
 
-**Core design rule:** T_prop anchors, T_queue signals, T_noise is noise. KCC never pays for noise.
+**Core design rule:** T_prop anchors, T_queue signals, T_noise is isolated.  KCC structurally prevents T_noise from directly triggering rate-reduction mechanisms (ECN backoff, gain decay).  Residual T_noise that passes the outlier gate enters decisions only through an attenuated, Kalman-gain-mediated feedback that makes the filter MORE conservative (higher adaptive R → lower K_ss → slower convergence).  This is an indirect throughput cost — slower convergence means x_est may stay conservatively below T_prop longer during path-change recovery, yielding slightly lower throughput temporarily — but it is a stability-preserving, bounded-cost response, not a deliberate "payment" for noise.
 
 ### Formal Proofs of the Three-Component Model
 
@@ -408,13 +408,13 @@ $$
 
 is the maximum-likelihood estimator of T_prop. This is a deterministic functional of the data requiring no model parameters.
 
-**Theorem (Censored Kalman MMSE).** Under the Gaussian noise model with one-sided constraint, the censored Kalman filter (CKF)
+**Theorem (Censored Kalman Conditional Minimum-Variance).** Under the Gaussian noise model with one-sided constraint, the censored Kalman filter (CKF)
 
 $$
 \hat{x}_k = \hat{x}_{k-1} + K_k \cdot \nu_k \cdot \mathbb{1}(\nu_k \leq 0)
 $$
 
-is the minimum mean-square error (MMSE) estimator of T_prop. It is a Tobit-type censored regression (Tobin 1958) with selection rule
+is the minimum-variance estimator of T_prop among all estimators satisfying the one-sided physical constraint — i.e., conditionally optimal on gate-accepted samples.  It is NOT the unconditional MMSE estimator: truncating a normal distribution introduces the Mills-ratio bias E[ν | ν<0] = −σ√(2/π) ≠ 0.  KCC does not apply a Heckman two-step correction; it accepts a small downward (conservative, safe) bias in exchange for implementation simplicity.  It is a Tobit-type censored regression (Tobin 1958) with selection rule
 
 $$
 i_k = \mathbb{1}(z_k < \hat{x}_k^-)
@@ -514,15 +514,13 @@ The directional update IMPLEMENTS this projection:
 
 Thus the directional update EXACTLY implements the constrained-projection Kalman filter (Gupta & Hauser 2007, Eq. 22-24): the projection of the unconstrained update x̂^unc = x̂⁻ + K·ν onto the feasible set {x ≤ z_k} yields x̂⁺ = min(x̂^unc, x̂⁻) for the one-sided constraint x ≤ z_k with ν_k = z_k − x̂⁻. This is a closed-form solution of the projection argmin_{x ≤ z_k} ‖x − x̂^unc‖²_{P⁻¹} — not an approximation.
 
-**Derivation of the O(K²) single-step error bound.** Let x̂* = min(x̂^unc, x̂⁻) be the exact constrained optimum. The directional update uses x̂_dir = x̂^unc when ν < 0, x̂⁻ when ν > 0. The P-norm error is zero when the constraint is inactive (ν > 0: both keep x̂⁻). When ν < 0:
+**Derivation of the O((1−K)²) single-step error bound.** When ν < 0, the unconstrained Kalman optimum x̂^unc = x̂⁻ + K·ν (with K < 1, ν < 0) exceeds the constraint x ≤ z_k = x̂⁻ + ν because K·ν > ν (less negative).  The true constrained optimum is x̂* = z_k (push to the boundary).  The directional update uses x̂_dir = x̂^unc = x̂⁻ + K·ν.  The error between directional update and constrained optimum is:
 
 $$
-‖x̂_dir − x̂*‖²_P⁻¹ = ‖x̂^unc − min(x̂^unc, x̂⁻)‖²_P⁻¹
-                    = ‖K·ν‖²_P⁻¹ · 1(ν < 0 ∧ x̂^unc > x̂⁻)
-                    = K²·ν²/(p_pred) · 1(ν < 0)
+‖x̂_dir − x̂*‖² = ‖(x̂⁻ + K·ν) − (x̂⁻ + ν)‖² = (1−K)²·ν²
 $$
 
-Since ν² is bounded by the Chebyshev gate (|ν| ≤ 5·σ_jitter), and 1/p_pred ≤ 1/p_est_floor, the per-step error is $$‖error‖² ≤ K²·25·σ_jitter²/p_floor$$. For K = K_ss ≈ 0.39: $$0.152·25·σ_jitter²/p_floor$$. Relative to a step where innovation would otherwise be fully accepted (gain = 1, full innovation), this is O(K²) ≈ 15% of the innovation's weight — matching the claim. As K → 0, the approximation error vanishes identically; as K → 1, the directional update becomes the exact constrained optimum. (Gupta & Hauser 2007, §3.2, Eq. 26-28)
+The error is O((1−K)²), not O(K²).  At K = K_ss ≈ 0.39: (1−0.39)² = 0.37; the directional update error is ~37% of the innovation's squared magnitude relative to the constrained optimum.  When ν > 0, both the constrained optimum and the directional update keep x̂⁻ (no update), so the error is zero.  As K → 0 the filter is insensitive and the error approaches ν² (full innovation); as K → 1 the directional update approaches the constrained optimum.  (Gupta & Hauser 2007, §3.2, Eq. 26-28)
 
 **3. Almost-Sure Convergence**
 
@@ -566,9 +564,9 @@ The drift correction mechanism (Tiers 1 & 2) is NOT a fallback for a "broken" fi
 
 **1. Outlier gating alone fails on moderate queues.** A standard Kalman filter with outlier gating (threshold at ±5σ) accepts ALL innovations within [−5σ, +5σ]. When T_queue = 2 ms and σ_jitter = 1 ms, the outlier gate sees |ν| = 2 ms < 5 ms threshold → accepts the innovation. The Kalman update drives x̂ upward by K × 2 ms = 0.78 ms (at K_ss = 0.39). Over N consecutive queued samples, the expected upward drift is N × K × μ_queue — **the estimate inflates linearly with sustained queue exposure.** The directional update structurally rejects ALL positive innovations regardless of magnitude — it is queue-agnostic.
 
-**2. The loss function differs — one-sided vs symmetric.** A standard KF minimizes the symmetric mean-squared error E[(x̂ − x)²] which penalizes overestimation and underestimation equally. Congestion control requires ASYMMETRIC loss: overestimating T_prop (x̂ > T_prop) causes cwnd inflation → catastrophic queue buildup; underestimating T_prop (x̂ < T_prop) causes conservative cwnd → bounded throughput loss. The directional update implements the minimax solution for the asymmetric loss L(x̂, x) = c_over · max(0, x̂ − x) + c_under · max(0, x − x̂) with c_over ≫ c_under (overestimation is O(BDP) queue cost; underestimation is O(BDP·gain) throughput cost). The standard KF has c_over = c_under = 1 by construction — it is provably misaligned with the congestion control objective.
+**2. The loss function differs — one-sided vs symmetric.** A standard KF minimizes the symmetric mean-squared error E[(x̂ − x)²] which penalizes overestimation and underestimation equally. Congestion control requires ASYMMETRIC loss: overestimating T_prop (x̂ > T_prop) causes cwnd inflation → catastrophic queue buildup; underestimating T_prop (x̂ < T_prop) causes conservative cwnd → bounded throughput loss. The directional update outperforms the symmetric KF for the asymmetric loss L(x̂, x) = c_over · max(0, x̂ − x) + c_under · max(0, x − x̂) with c_over ≫ c_under (overestimation is O(BDP) queue cost; underestimation is O(BDP·gain) throughput cost). The standard KF has c_over = c_under = 1 by construction — it is provably misaligned with the congestion control objective.
 
-**3. One-sided Uniformly Most Powerful (UMP) test.** The directional gate φ(ν_k) = 𝟙(ν_k ≤ 0) is the Neyman-Pearson UMP test for H₀: μ = 0 vs H₁: μ > 0 (one-sided) under Gaussian innovations. By the Neyman-Pearson Lemma (1933), among all level-α tests, the UMP test maximizes power (i.e., correctly rejects queued samples) for all μ > 0. A symmetric outlier gate (two-sided rejection at ±5σ) is a LOWER-POWER test for the relevant one-sided alternative: its critical region |ν| > 5σ rejects H₀ symmetrically, wasting power density on ν ≪ −5σ (which almost never occur under H₁: q > 0). The directional gate concentrates ALL power on ν > 0 — the only direction containing T_queue information. Power comparison: at μ_q/σ = 2, the directional UMP test has power Φ(2 − z_α) ≈ Φ(2 − 1.645) ≈ 0.64 (one-sided 5% level). A two-sided 5% test has power Φ(2 − 1.96) − Φ(2 + 1.96) ≈ 0.516 − 0 ≈ 0.52 — lower by 12 percentage points.
+**3. One-sided Uniformly Most Powerful (UMP) test.** The directional gate φ(ν_k) = 𝟙(ν_k ≤ 0) is a one-sided decision rule: it rejects H₀ (declares T_queue present) when ν_k > 0.  Under Gaussian innovations, this is a one-sided test with effective size α = P(ν_k > 0 | H₀) = 0.5.  The UMP property (Neyman-Pearson Lemma) holds at the chosen significance level: for any alternative μ > 0, the threshold-0 test maximizes power at its operating point among all tests with the same size α = 0.5.  The power comparison below uses a hypothetical 5%-level one-sided test to illustrate the power gap between one-sided and two-sided rejection regions — the actual KCC gate (threshold 0) has a larger size (α = 0.5) but the same directional optimality property.  Under the assumption of approximately Gaussian innovations at filter convergence (applicable when outlier rejection has removed T_noise spikes and the residual is dominated by i.i.d. measurement jitter), the Neyman-Pearson Lemma guarantees maximum power for the chosen size.  For bounded non-Gaussian T_noise (NIC coalescing bursts, ACK compression), the gate remains a robust one-sided test but loses formal UMP optimality — the UMP property holds to the extent that the Gaussian approximation is valid.
 
 **4. Censored vs trimmed regression.** The directional update is Tobit-type censored regression (Tobin 1958) — observations are STRUCTURALLY partitioned by sign. A standard KF with outlier rejection is trimmed regression — observations are discarded based on magnitude relative to a dispersion parameter. Censoring has a closed-form bias correction (Heckman two-step); trimming does not. Under persistent queue (μ_q > 0 on most samples), the censored estimator remains unbiased for T_prop (any gate-passing sample has q_k = 0 by construction); the trimmed estimator is asymptotically biased (the trimming threshold MUST exceed μ_q to pass ANY sample, but then the gate passes queue-contaminated samples).
 
@@ -577,7 +575,7 @@ The drift correction mechanism (Tiers 1 & 2) is NOT a fallback for a "broken" fi
 - Symmetric KF with ±5σ outlier gate: admits all |ν| < 5σ (σ ≈ 1ms). Among p_clean = 0.3 clean samples, 96% pass (Chebyshev). Among (1−p_clean) = 0.7 queued samples with μ_q = 2ms, ν = μ_q + η ∼ N(2, 1). P(|ν| < 5 | μ = 2) = Φ(3) − Φ(−7) ≈ 0.999. So virtually ALL queued samples pass. Effective per-round bias: K_ss × [(1−p_clean) × μ_q] = 0.39 × 0.7 × 2 = 0.546 ms/round upward — estimate drifts up by 54.6 ms in 100 rounds.
 - Directional KF: only ν < 0 samples accepted. For queued samples: P(ν < 0 | μ = 2) ≈ Φ(−2) ≈ 0.023 → only 2.3% of queued samples pass. For clean samples: P(ν < 0 | μ = 0) = 0.5 → 50% pass. Effective per-round bias: on clean passing samples, E[ν | ν<0, μ=0] = −σ·√(2/π) ≈ −0.8 (downward). On queued passing samples, E[ν | ν<0, μ=2] ≈ 2 − 2.373 ≈ −0.373 (still slightly downward — the truncation shifts the mean below zero). **Net bias = p_clean × 0.5 × (−0.8) + (1−p_clean) × 0.023 × (−0.373) = −0.12 − 0.006 ≈ −0.126 ms/round downward — estimate drifts conservatively DOWN (safe), not up.**
 
-**Conclusion:** The directional update is provably superior to a standard Kalman filter with outlier rejection for the congestion control estimation task. The directional gate implements the UMP one-sided test (Neyman-Pearson optimal), matches the asymmetric cost function of congestion control, and maintains asymptotic unbiasedness through structural censoring rather than magnitude-based trimming. A symmetric KF with outlier rejection would systematically inflate the T_prop estimate by K_ss × (1−p_clean) × μ_q per round under persistent queue — producing biased, unsafe estimates.
+**Conclusion:** The directional update is provably superior to a standard Kalman filter with symmetric outlier rejection **for the asymmetric congestion-control loss function** where over-estimation cost (c_over → overshoot → loss) dominates under-estimation cost (c_under → conservative pacing → slight throughput reduction).  The directional gate implements the UMP one-sided test (Neyman-Pearson optimal under Gaussian approximation), matches the asymmetric cost function of congestion control, and maintains downward-conservative bias through structural censoring rather than magnitude-based trimming.  A symmetric KF with outlier rejection would systematically inflate the T_prop estimate by K_ss × (1−p_clean) × μ_q per round under persistent queue — producing biased, unsafe estimates.
 
 ---
 
@@ -612,7 +610,7 @@ The two-tier structure implements a **Sequential Probability Ratio Test** (SPRT,
 
 **3. Optimality**
 
-In Mode 0, the censored Kalman filter is MMSE-optimal on the clean-sample subspace (Proof C.1). In Mode 1, the boosted-Q filter tracks genuine baseline drift. The Neyman-Pearson test guarantees mode switching only under overwhelming evidence for H_1, preventing false switches from corrupting the Mode 0 estimate.
+In Mode 0, the censored Kalman filter is conditionally minimum-variance on accepted (ν_k < 0) samples (Proof C.1) — i.e., optimal conditional on the event that the sample passes the directional gate, not unconditionally across all samples.  In Mode 1, the boosted-Q filter tracks genuine baseline drift.
 
 **4. References**
 
@@ -696,7 +694,9 @@ $$
 
 yields the truncated update as the score-equation solution.
 
-**References:** Tobin (1958), Amemiya (1984), Kalman (1960).
+**Bias acknowledgement.**  Truncating a normal distribution introduces a conditional mean shift: for clean samples (μ = 0), the expected innovation conditioned on ν < 0 is E[ν | ν < 0] = −σ·√(2/π) ≠ 0 — the Mills ratio term.  The KCC implementation does **not** apply a Heckman two-step bias correction; it applies the raw Kalman gain with optional dampening (kcc_neg_innov_dampen_shift).  This means the directional update is a **biased** (conservatively downward) estimator of T_prop — it is NOT the MMSE estimator.  The bias is downward (safe for CC: biased-low T_prop → conservative BDP → no overshoot), and its magnitude (~0.13 ms/round at default parameters) is acceptable for CC purposes where the dominant error is upward T_queue contamination, not downward truncation bias.  See Proposition 1 and §5 of the directional update analysis (README §2.1) for the quantitative bias comparison between symmetric KF and directional KF.
+
+**References:** Tobin (1958), Amemiya (1984), Kalman (1960), Heckman (1979).
 
 ---
 
@@ -755,7 +755,7 @@ The claim that KCC "abandons Kalman optimality" confuses the UNCONSTRAINED Kalma
 
 **Path 2:** T_noise elevates jitter_ewma, which increases Kalman R (measurement noise). Higher R reduces K (the Kalman gain), making the filter less responsive — a conservative response that preserves stability at the cost of slightly slower convergence (bounded by Theorem 2).
 
-**CONCLUSION:** T_noise enters decisions only through an attenuated, stability-preserving feedback that makes the filter MORE conservative, never more aggressive. T_noise NEVER causes KCC to reduce its send rate (that would be paying for noise). Noise does NOT mean the bottleneck capacity dropped. KCC never pays for noise.
+**CONCLUSION:** T_noise enters decisions only through an attenuated, stability-preserving feedback that makes the filter MORE conservative, never more aggressive. T_noise does not directly trigger KCC rate-reduction mechanisms (ECN backoff, gain decay).  The indirect effect of T_noise — slower convergence via higher adaptive R — is a bounded throughput cost, not a deliberate rate cut.  Noise does NOT mean the bottleneck capacity dropped.  KCC structurally isolates T_noise from direct rate decisions.
 
 All code in `tcp_kcc.c` is organized around this decomposition. Every function, struct field, and `#define` constant is annotated with `[T_prop]`, `[T_queue]`, `[T_noise]`, or `[K]` (Kalman filter machinery) to identify which component it processes.
 
@@ -763,9 +763,27 @@ All code in `tcp_kcc.c` is organized around this decomposition. Every function, 
 
 ## Part II: Closed-Loop Stability — ISS Framework
 
-KCC is not a heuristic.  It is a provably stable feedback control system.
+KCC is not a heuristic.  It is a stability-oriented feedback control system whose convergence is provable under explicitly stated assumptions.  The theorems below establish bounded-time convergence, bounded-input bounded-output (BIBO) stability, and input-to-state stability (ISS) — with each assumption documented and its operational implications noted.
 
-### Theorem 1 — Lyapunov Global Asymptotic Stability
+---
+
+### §2.0 Assumptions and Scope of the Stability Proofs
+
+The formal theorems in Part II rely on several assumptions that must be understood when interpreting their claims.  No assumption is hidden; each is stated explicitly in the theorem preamble and discussed here.
+
+| Assumption | Statement | Operational Impact |
+|---|---|---|
+| **A1. Persistent Excitation** | `p_clean > 0` — clean RTT samples (T_queue = 0) arrive with positive probability. | In persistent standing-queue regimes where no clean sample arrives, the directional update cannot separate T_prop from T_queue (see Proof K). |
+| **A2. Estimator Convergence** | The Kalman filter has converged to within a bounded neighbourhood of T_prop at equilibrium. | Theorem 1's equilibrium analysis takes d\* = 0 as a premise, not a conclusion of the queue dynamics alone. |
+| **A3. Expected Contraction** | The Kalman contraction in Theorem 2 is stated in expectation and conditioned on clean-sample arrivals. | Per-round behaviour includes rounds with no contraction (Case B: queue present, |d_{k+1}| = |d_k|). |
+| **A4. p_clean Origin** | The numerical value p_clean = 0.3 comes from an M/D/1 queue model with utilisation ρ = 0.7 — an **external physical parameter**, not measured by KCC internally. | The value affects convergence **speed** bounds, not convergence **existence**.  For known ρ, p_clean can be tuned.  For unknown paths, the default provides conservatively slow convergence bounds. |
+| **A5. Default Configuration** | The stability theorems describe the system's mathematical structure.  In the **default shipping configuration** (`kcc_rtt_mode = FILTER = 1`, `kcc_probe_rtt_decouple = 1`), KCC uses x_est_us alone for BDP (no maximin), skips periodic PROBE_RTT when the Kalman is healthy, and does **not** enable the cross-connection Global Kalman BDP filter (`kcc_kf_enable = 0`).  The N-flow fairness corollary assumes shared T_prop estimates, which in the default configuration exist only per-socket. | The FILTER default is the recommended production mode.  MIN mode and global KF are opt-in. |
+
+These assumptions are not limitations of KCC specifically — they are fundamental properties of any endpoint-only RTT-based CCA with a single scalar observable per ACK.  Theorem K.1 (Proof K) establishes that without at least one clean sample (T_queue = 0), the algebraic inseparability of T_prop and T_queue is a **physical information limit**, not an implementation deficiency.
+
+---
+
+### Theorem 1 — Lyapunov Stability (with Explicit Estimator-Convergence Assumption)
 
 **System state at round k:** $$s_k = (q_k, x_k)$$ where q_k ≥ 0 is queue (bytes) and x_k is the Kalman estimate of T_prop.
 
@@ -782,10 +800,13 @@ $$
 
 **Let d_k = x_k - T_prop** (estimation error).
 
-**Equilibrium:**
+**Equilibrium (conditional on estimator convergence):**
 
+Under Assumption A2, if the Kalman filter has converged so that d_k ≈ 0 (i.e., x_k ≈ T_prop), then:
 - q* = 0: Lindley gives $$cwnd \cdot MSS = C \cdot T_{prop}$$ at cruise 1.0x → queue drains to zero
-- d* = 0: Kalman converges to T_prop under directional update (Proof C)
+- This equilibrium is a **fixed point** of the coupled (queue, estimator) system: when d=0, the queue drains; when q=0, clean samples arrive, sustaining estimator convergence.
+
+The analysis below separates the queue-drain dynamics (which are monotonic and unconditional) from the estimator-convergence dynamics (which are addressed in Theorem 2). Theorem 1 demonstrates that **given** a converged estimator, the queue dynamics are Lyapunov-stable with (0,0) as the unique attractor.  The full closed-loop proof couples Theorem 1 (queue → drain) with Theorem 2 (estimator → converge) via the small-gain argument in Theorem 3.
 
 **Lyapunov candidate:**
 
@@ -808,9 +829,9 @@ $$
 
 **Result:** For q_k > 0 and d_k > 0, ΔV < 0 strictly per step. For d_k < 0, ΔV < 0 over bounded cycles (GUAS). (0,0) is the unique global attractor. The directional update provides one-sided stability: x_est cannot drift above T_prop from T_queue contamination.
 
-### Theorem 2 — Kalman Contraction Mapping under Directional Update
+### Theorem 2 — Kalman Contraction Mapping under Directional Update (Expectation-Conditioned)
 
-**Claim:** Under the directional update, the Kalman filter is a strict contraction — estimation error decays exponentially.
+**Claim:** Under the directional update with persistent excitation (p_clean > 0, Assumption A1), the Kalman filter is a contraction **in conditional expectation** — estimation error decays geometrically when averaged over rounds with clean samples.  Per-round behaviour includes rounds with |d_{k+1}| = |d_k| (Case B: queue present, no contraction).
 
 **At round k, one of three cases applies:**
 
@@ -905,7 +926,7 @@ $$
 T_1% = log(0.01) / log(1 - K_ss * p_clean) RTTs
 $$
 
-With $$K_{ss} = 0.39$$, $$p_{clean} = 0.3$$, $$\sigma = 1 \ \mu\text{s}$$, $$|d_0| = 25 \ \text{ms}$$: $$T_{1\mathrm{\%}} = \ln(0.01) / \ln(1 - 0.39 \times 0.3) \approx 37 \ \text{RTTs}$$. The more conservative bound $$T_{\sigma}$$ (convergence to within one noise standard deviation of zero) uses $$\ln(\sigma/|d_0|) / \ln(1 - K_{ss} \cdot p_{clean}) = \ln(10^{-6}) / \ln(0.883) \approx 111 \ \text{RTTs}$$ (about 2.8 seconds at 25 ms RTT).
+With $$K_{ss} = 0.39$$, $$p_{clean} = 0.3$$, $$\sigma = 1 \ \mu\text{s}$$, $$|d_0| = 25 \ \text{ms}$$: $$T_{1\mathrm{\%}} = \ln(0.01) / \ln(1 - 0.39 \times 0.3) = \ln(0.01) / \ln(0.883) \approx 37 \ \text{RTTs}$$ (1% residual error).  The σ-noise convergence bound uses $$\ln(\sigma/|d_0|) / \ln(1 - K_{ss} \cdot p_{clean})$$ with $$\sigma/|d_0| = 10^{-6} / 0.025 = 4 \times 10^{-5}$$: $$T_{\sigma} = \ln(4\!\times\!10^{-5}) / \ln(0.883) = -10.13 / -0.1245 \approx 81 \ \text{RTTs}$$ (about 2.0 seconds at 25 ms RTT).
 
 **Boundary condition:** If p_clean = 0 (queue never drains — perpetual cross-traffic oversubscription), Case A never occurs, and no congestion control algorithm can obtain a clean T_prop sample. This is a fundamental physical limitation (Proof C, boundary B1), not a KCC deficit.
 
@@ -1118,7 +1139,7 @@ where $$α_O = (2K−K²)·(1−1/(2ε))$$ and $$σ_O = K²·(1+ε/2)$$. Conditi
 **Explicit numerical computation:**
 
 - At K_ss = 0.39 (Q=100, R=400): ε = 0.6279/0.4758 = 1.32. α_O = 0.6279·0.621 = 0.390. σ_O = 0.1521·1.66 = 0.252.
-- At K_ss = 0.93 (adaptive Q=2500): ε = 0.9951/0.1302 = 7.64. α_O = 0.9951·0.935 = 0.930. σ_O = 0.8649·4.82 = 4.17.
+- At K_ss = 0.88 (adaptive Q=2500, R=400): per Riccati p_ss = (2500+√(2500²+4·2500·400))/2 = 2851, K_ss = 2851/(2851+400) = 0.877.  (The previously-stated value 0.93 was a numerical error; see the Riccati derivation at L1904 for the standard calculation.)
 - Note: α_O simplifies exactly to K_ss. Proof: α_O = (2K−K²)·(1 − (1−K)/(2−K)) = (2K−K²)/(2−K) = K. The observer Lyapunov decay rate IS the Kalman gain.
 
 As $$k → ∞$$: $$K_k → K_ss = p_ss/(p_ss+R)$$ where $$p_ss = (Q+√(Q²+4QR))/2$$ (PREDICTED steady-state covariance). For Q=100,R=400: K_ss ≈ 0.39. With adaptive Q=2500: K_ss ≈ 0.88. Worst-case: K_ss < 1 always.
@@ -1277,7 +1298,7 @@ Each component satisfies its ISS-Lyapunov inequality with cross-coupling terms f
 
 | Phase | Kalman gain K | Pacing gain g | γ_PO (plant→obs) | γ_OP (obs→plant) | κ_cross = γ_PO·γ_OP |
 |-------|--------------|--------------|-------------------|-------------------|---------------------|
-| PROBE | K_ag = 0.93  | g_probe = 1.25 | 0 (gate blocks)  | 1.25              | **0** < 1 ✓         |
+| PROBE | K_ag = 0.88  | g_probe = 1.25 | 0 (gate blocks)  | 1.25              | **0** < 1 ✓         |
 | CRUISE | K_ss = 0.39 | g_cruise = 0.95 | 0.39             | 0.95              | **0.371** < 1 ✓     |
 
 **PROBE phase:** The directional gate (Theorem 3, §5.5) BLOCKS queue-contaminated innovations. γ_PO = 0 because the observer ignores the queue it creates. The plant→observer path is OPEN: $$κ_cross = 0 < 1$$ ✓.
@@ -1320,7 +1341,7 @@ with **phase-dependent concrete coefficients**:
 **PROBE phase** (gate closed, loop open):
 
 - $$κ_P = 1.0$$ per round (plant decay, at q_max = BDP)
-- $$κ_O = K_ag·(2−K_ag) = 0.93 × 1.07 = 0.995$$ (observer, K_ag = 0.93)
+- $$κ_O = K_ag·(2−K_ag) = 0.88 × 1.12 = 0.986$$ (observer, K_ag = 0.88)
 - $$κ_C = N/A$$ (probe: V_C increases temporarily, recovered in drain)
 - $$κ_cross = 0$$ (gate blocks plant→observer, loop open) ✓
 
@@ -1341,7 +1362,7 @@ The cross-coupling is PHASE-DEPENDENT: $$κ_cross = 0$$ in PROBE (gate blocks), 
 
 Worst-case evaluation (CRUISE phase, both paths active):
 
-- K_ss = 0.39 (steady-state Kalman gain); worst-case K_ag = 0.93 only when gate is closed (κ_cross = 0)
+- K_ss = 0.39 (steady-state Kalman gain); worst-case K_ag = 0.88 only when gate is closed (κ_cross = 0)
 - g_cruise = 0.95 (conservative effective cruise pacing gain)
 - κ_cross = 0.39 × 0.95 = 0.371 < 1 — satisfied with margin 1/0.371 ≈ 2.7×
 - At nominal K_ss = 0.39 with g ≤ 1.0: κ_cross ≤ 0.39 ≪ 1
@@ -1378,13 +1399,15 @@ The binding rate is min(1.0, 0.63, 0.08) = 0.08 (controller-limited), giving a c
 
 #### 5.10 Conclusion
 
-The entire KCC system (outer BBR FSM + inner Kalman observer + PROBE_BW cycle + LT_BW + ECN backoff + drain-skip) forms a **provably globally asymptotically stable** closed-loop control system. No empirical validation is needed to establish stability — the proof follows from peer-reviewed control theory built from first-principles physical modeling:
+The core KCC system (outer BBR FSM + inner Kalman observer + PROBE_BW cycle) forms a **provably stable** closed-loop control system **under the ideal dwell-time model** (Theorems 1–6).  The proofs follow from peer-reviewed control theory built from first-principles physical modeling:
 
 - Three-component RTT decomposition (Proofs A-F)
 - Kalman filter contraction (Theorem 2)
 - ISS cascade composition (Sontag & Wang, 1995)
 - Small-gain theorem (Jiang & Mareels, 1997)
-- Switched system stability (Liberzon, 2003)
+- Switched system stability with dwell-time (Liberzon, 2003)
+
+**Scope of the proofs vs. engineering extensions.**  The Theorem 5/6 proofs assume each PROBE_BW phase (PROBE/DRAIN/CRUISE) lasts at least 1 RTT — the Liberzon (2003) dwell-time condition.  The engineering extensions (drain-skip, drain-to-target AND-gate, PROBE_RTT decoupling) **reduce** or **eliminate** the DRAIN dwell in specific healthy-path conditions.  These mechanisms are gated by preconditions that guarantee they fire only when no standing queue exists (p_est < converged threshold, qdelay < clean threshold for drain-skip; Kalman healthy for PROBE_RTT decoupling), making the skipped drain redundant for stability in those cases.  The stability of the system under drain-skip relies on the ISS cascade bound (Theorem 5) rather than the switched-system dwell-time argument, which applies to the worst-case mode-switching path.  A full end-to-end proof incorporating all Part III mechanisms remains an open problem.
 
 **Academic References (full citations):**
 
@@ -1413,7 +1436,7 @@ Every theorem cited is a publicly verifiable, peer-reviewed result. The KCC stab
 
 The only physical inputs required: (i) RTT = T_prop + T_queue + T_noise, (ii) Lindley recursion, (iii) bottleneck C exists, (iv) |T_noise| ≤ η_max. All are definitional or physically established in the networking literature.
 
-_Complete proofs with step-by-step algebra are in `tcp_kcc.c` header, Closed-Loop Control Theory (Proofs D-F: lines 1589–1814, Theorems 1-4: lines 2691–2900, Theorem 5: lines 3155–4023, Theorem 6: lines 4073–4361, Propositions 1-4: lines 4371–4479)._
+_Complete proofs with step-by-step algebra are in `tcp_kcc.c` header (search by section name: Proofs D-F, Theorems 1-5, Theorem 6, Propositions 1-4)._
 
 ---
 
@@ -1575,29 +1598,110 @@ The Lur'e formulation applies because: (a) the linear part $$G(z) = K/(z - (1-K)
 
 ### Corollary — N-Flow Fairness
 
-All N KCC flows sharing a bottleneck with common T_prop converge to $$rate_i → C/N$$ for all i.
+All N KCC flows sharing a bottleneck with common T_prop converge to $$rate_i → C/N$$ for all i, regardless of the `kcc_rtt_mode` setting (FILTER or MIN).  Neither mode "provides" fairness; fairness arises from mechanisms orthogonal to the `model_rtt` computation.  Below we prove this claim and demonstrate why MIN mode neither helps nor harms fairness compared to FILTER mode.
 
-**Proof:** From Theorem 1, the unique equilibrium has all flows at their fair-share BDP. From Theorem 2, the Kalman filter guarantees convergence from any initial condition. The directional update (all flows reject T_queue) prevents winner-takes-all: no flow can lower its apparent T_prop below the physical minimum, because queue-induced RTT increases are structurally excluded from all flows' T_prop estimates. The symmetric nature of the directional gate across competing flows (none can exploit queue to bias their estimate) ensures symmetric equilibrium shares. See Theorem 3 (Small-Gain Stability) applied to N identical KCC controllers with common Lyapunov function.
+---
 
-**Coupled-Lyapunov proof for multi-flow interaction:**
+#### §Fairness.1 Fairness Mechanisms (Identical in Both Modes)
 
-Consider N identical KCC flows sharing a bottleneck of capacity C. Each flow i has state (q_i, e_i, cwnd_i) where q_i is the per-flow queue contribution (q_total = Σ_i q_i), e_i = x_est_i − T_prop, and cwnd_i is the congestion window.
+KCC's throughput fairness comes from **three** mechanisms, all three of which are independent of `model_rtt`:
 
-Define the coupled Lyapunov function:
+| Mechanism | FILTER | MIN | Impact on Fairness |
+|-----------|--------|-----|--------------------|
+| **BBR PROBE_BW gain cycling** | 8-phase [1.25, 0.75, 1.0⁶] with randomised starting phase | **Identical** | Each flow probes for bandwidth at 1.25× and drains queue at 0.75×. The max-bandwidth filter (10-RTT sliding window) captures each flow's observed delivery rate. Under saturated bottleneck, the symmetric gain pattern converges to fair share. |
+| **Directional gate** | ∀ν_i > 0: reject (skip update) | **Identical** | No flow can lower its x_est by capturing queue. Any flow that grabs more bandwidth sees queue → positive innovation → gate blocks it. BBRv1's min_rtt-inflation unfairness is structurally eliminated. |
+| **Bandwidth observation model** | `bw_i = max_bw(delivered_i / interval_us)` per-flow slotted max filter | **Identical** | Each flow independently measures its own delivery rate. The max-filter is symmetric across flows. No cross-flow sharing required. |
 
-$$V_coupled = Σ_i (q_i/C)²/2 + Σ_i (d_i)²/2$$
+The `model_rtt` parameter is used **only** in `kcc_bdp()` to compute the cwnd ceiling:
 
-where d_i = x_est_i − T_prop is the estimation error of flow i.
+$$cwnd_i^{target} = \frac{bw_i \cdot model\_rtt}{MSS}$$
 
-Key observations:
+This is an **upper bound** on cwnd, not a throughput determinant.  Pacing rate (which governs actual throughput) is computed from bandwidth alone:
 
-1. **Shared T_prop.** All flows share the same physical T_prop (common bottleneck assumption). Each flow's Kalman filter targets the same latent variable, so the equilibrium estimate is identical across all flows.
+$$pacing_i = bw_i \cdot pacing\_gain$$
 
-2. **Independent directional gates.** Each flow's directional gate independently rejects queue-induced positive innovations. The N directional gates operate independently: flow i's gate rejects ν_i > 0 regardless of the other flows' states. This prevents any flow from lowering its x_est below T_prop via queue capture — capturing more queue share cannot produce negative innovations for the capturing flow.
+Because `bw_i` and `pacing\_gain` are identical in both modes, the **actual sending rates converge identically** regardless of how `model_rtt` is computed.
 
-3. **Equilibrium convergence.** At equilibrium, the BBR rate controller sets each flow's pacing rate to cwnd_i / T_prop. The bottleneck constraint Σ_i cwnd_i / T_prop ≤ C forces cwnd_i = BDP/N for all i at the unique equilibrium where q = 0.
+---
 
-The symmetric equilibrium (cwnd_i = BDP/N, q_i = 0, e_i = 0) is the unique attractor. The N controllers are identical (same code, same parameters), the plant is symmetric in the flow indices (FIFO queue treats all packets equally), and the observation model is symmetric (all flows measure RTT = T_prop + T_queue_total + T_noise_i with i.i.d. T_noise). By the standard "identical controllers + symmetric plant → symmetric equilibrium" argument from multi-agent control theory (Fax & Murray 2004, Theorem 1: symmetric consensus under identical agent dynamics), any asymmetric equilibrium would require a symmetry-breaking mechanism, but the directional gate eliminates the only candidate (queue-biased estimation). Therefore V_coupled decreases along all trajectories to the symmetric fixed point.
+#### §Fairness.2 Why MIN Mode Does NOT Enhance Fairness (Rigorous Proof)
+
+**Claim:** `kcc_rtt_mode` does not affect the N-flow fairness properties of KCC.
+
+**Proof.**  Consider any two operating modes M₁ and M₂ that differ only in how `model_rtt_i` is computed from the same underlying estimates (`x_est_i`, `min_rtt_us_i`).  For each flow i, the throughput is:
+
+$$T_i = \frac{bw_i \cdot pacing\_gain_i}{MSS} \cdot MSS = bw_i \cdot pacing\_gain_i$$
+
+where `bw_i` is the max-filtered delivery rate and `pacing_gain_i` is the PROBE_BW cycle gain.  Neither `bw_i` nor `pacing_gain_i` depends on `model_rtt_i`.  Therefore:
+
+$$T_i^{(FILTER)} = T_i^{(MIN)} \quad \forall i$$
+
+The fairness index $$F = \frac{(\sum T_i)^2}{N \sum T_i^2}$$ depends only on the {T_i}, which are identical in both modes.  Hence `F(FILTER) = F(MIN)` for all t.
+
+**Corollary.**  The claim that "MIN mode provides fairness" or "FILTER mode degrades fairness" is incorrect.  Fairness is governed by bandwidth dynamics and gain symmetry, neither of which involves `model_rtt`.
+
+---
+
+#### §Fairness.3 Where MIN Mode Differs from FILTER (Performance, Not Fairness)
+
+MIN mode clamps `model_rtt = min(x_est_us, min_rtt_us)`, while FILTER uses `model_rtt = x_est_us`.  The practical difference:
+
+| Scenario | FILTER mode | MIN mode | Fairness impact |
+|----------|-------------|----------|-----------------|
+| x_est converged (d ≈ 0) | model_rtt = T_prop | model_rtt = min(T_prop, min_rtt) = T_prop (min_rtt ≥ T_prop always) | **None** — identical |
+| x_est > T_prop (transient over-estimation) | model_rtt inflated → cwnd ceiling higher → more burst headroom | model_rtt = min_rtt_us ≤ T_prop → conservative cwnd → less burst tolerance | **None for throughput**, cwnd ceiling ≠ pacing rate |
+| Route change (T_prop increased) | Kalman adapts in ~10 RTTs → model_rtt rises → BDP rises | `min_rtt_us` is stale at old value → model_rtt stays low until window expires (up to 10s) → BDP UNDER-computed → throughput CLIFF | **Degrades this flow's throughput** (but symmetric across flows that experience the same route change) |
+| x_est < T_prop (conservative undershoot) | model_rtt = x_est < T_prop → BDP undershoots capacity | Same as FILTER (min_rtt ≥ T_prop, so min chooses x_est) | **None** — identical |
+
+The only case where MIN mode deviates significantly is route-change scenarios, where `min_rtt_us` lags behind the true T_prop for up to 10 seconds.  This creates a throughput penalty for the affected flow(s) but does not introduce asymmetry between competing flows (all flows on the same path experience the same route change).  Hence it does not affect the fairness equilibrium.
+
+---
+
+#### §Fairness.4 Formal Proof (Symmetric Multi-Agent Convergence)
+
+**Theorem (KCC N-Flow Fairness).**  Consider N identical KCC instances sharing a bottleneck link of capacity C with common physical T_prop.  Under the directional Kalman update (Theorem 2) and PROBE_BW gain cycling:
+
+1. The per-flow throughputs satisfy $$\lim_{t \to \infty} \frac{1}{t} \int_0^t T_i(\tau) d\tau = \frac{C}{N}$$ for all i.
+2. This holds for both FILTER (kcc_rtt_mode = 1) and MIN (kcc_rtt_mode = 0).
+
+**Proof.**
+
+*(a) Symmetric controller dynamics.*  Each flow i executes the same control law:
+
+$$\pacing_gain_i(t) = G(\phase_i(t)), \quad \phase_i \in \{0, \dots, 7\}$$
+
+with randomised initial phase offset.  The bandwidth estimate evolves as:
+
+$$bw_i^{(k+1)} = \max(bw_i^{(k)}, \deliver_rate_i^{(k)})$$
+
+Both equations are symmetric (identical for all i).  No `model_rtt_i` appears in either, so both modes produce identical {bw_i}, {pacing_gain_i} trajectories given identical inputs.
+
+*(b) Symmetric plant.*  The bottleneck is a FIFO queue with work-conserving scheduler.  The input to each flow's observation is the shared aggregate.  Different flows' RTT observations are:
+
+$$RTT_i(t) = T_{prop} + \frac{q_{total}(t)}{C} + \eta_i(t)$$
+
+where η_i(t) are i.i.d. measurement noise.  The directional gate on each flow rejects the positive bias from q_total/C, so every flow's innovation filter receives the same statistics:
+
+$$E[\nu_i | \nu_i \leq 0] = E[\nu_j | \nu_j \leq 0]$$
+
+*(c) Fax & Murray (2004) symmetry argument.*  The multi-agent system (N identical controllers + symmetric plant) has a diagonal group of permutations as its symmetry group.  By Fax & Murray Theorem 1, the control law is invariant under flow permutation, and the unique equilibrium is the symmetric solution `bw_i = C/N`, `q_total = C · T_prop`, `x_est_i = T_prop` for all i.
+
+*(d) Parameter independence.*  Since neither `pacing_gain_i` nor `bw_i` involves `model_rtt_i`, the entire proof chain (a)-(c) is **independent** of `kcc_rtt_mode`.  QED.
+
+---
+
+#### §Fairness.5 The Only Mechanism That CAN Affect Fairness
+
+The **cross-connection Global Kalman BDP filter** (`kcc_kf_enable = 1`) provides a **shared bandwidth estimate** `kcc_kf_x` that seeds `init_bw` for new connections.  This accelerates convergence by giving new flows a fair-share estimate before they have independently probed the path.  It does not change the equilibrium — the equilibrium is already symmetric — but it reduces the transient unfairness during connection startup.
+
+**Summary:**
+
+| | FILTER (default) | MIN | Global KF enabled |
+|---|---|---|---|
+| Fairness mechanism | PROBE_BW + gate | **Identical** | PROBE_BW + gate + shared init_bw |
+| Fairness guarantee | Proven | Proven | Proven (accelerated) |
+| Why? | `model_rtt` ∉ {bw, pacing} | Same | `kcc_kf_x` seeds bw, not T_prop |
+| What MIN actually does | — | Conservative BDP ceiling | — |
 
 **Heterogeneous RTT flows:** The proof above assumes a common bottleneck T_prop shared by all flows (identical path latency). When flows have different access-link RTTs (T_prop_i ≠ T_prop_j), the equilibrium cwnd_i = C · T_prop_i / MSS yields proportional fairness: flows with longer RTTs receive proportionally larger windows, maintaining equal throughput = C/N in steady state (conventional TCP-fairness result extended by the directional gate which prevents queue-based RTT inflation from distorting the T_prop_i estimate). Full convergence under heterogeneous RTTs follows from Theorem 2 with flow-specific K_ss_i; the coupled Lyapunov V_coupled = Σ_i w_i · V_i with weights w_i = T_prop_i / Σ_j T_prop_j generalizes to heterogeneous paths.
 
@@ -1652,6 +1756,8 @@ The threshold `kcc_recal_p_est_thresh` (default 25000) triggers PROBE_RTT drain 
 
 In either case, PROBE_RTT forces a clean RTT sample by reducing cwnd to minimum, providing a fresh observation to recalibrate the filter. This is a principled engineering response to model violation.
 
+**Boundary enforcement caveat.**  The proof that matched-R steady-state p_post_ss (22170 at Q=50000, R=32000) stays below `kcc_recal_p_est_thresh` (25000) depends on the **default** values of `kcc_kalman_q_est_max` and `kcc_kalman_r_est_max`.  The sysctl clamps for these parameters are `[1, 2×10⁹]` — far wider than the proof's assumed bounds.  Operators who raise q_est_max or r_est_max substantially above their defaults can push p_post_ss beyond 25000, invalidating the "normal operating range" guarantee.  The default values (50000/32000) were chosen jointly with the threshold (25000) through the Riccati steady-state equation to ensure p_post_ss < threshold by a ~12% margin; this relationship is by-design but not enforced by cross-parameter clamping.  For production deployments, keep q_est_max and r_est_max at their defaults unless you have independently verified the recalibration safety margin at your chosen values.
+
 ---
 
 ### Dual-Estimate Architecture and Conservative BDP Bound
@@ -1663,9 +1769,11 @@ KCC maintains two independent T_prop estimates:
 | **Kalman x_est** | Directional update | Updated only on RTT decreases (ν_k < 0). Converges downward to T_prop, never upward to queue-inflated values. | Defensive: structurally rejects T_queue contamination |
 | **Windowed min_rtt_us** | Aggressive floor | Updated on every RTT sample that beats the current minimum. May be inflated on persistent-queue paths. | Safety bound: prevents x_est from drifting below physical reality |
 
-**The model_rtt selection:** $$model_rtt = min(x_est_us, min_rtt_us)$$. This is a **maximin strategy**: take the most conservative estimate to prevent BDP overestimation.
+**The model_rtt selection (mode-dependent):**
+- **FILTER mode (default, kcc_rtt_mode = 1):** $$model_rtt = x_est_us$$ — uses the Kalman estimate directly for fast path-change adaptation.  This is the **recommended production mode**: it responds within ~3 RTTs to BGP reroutes and LEO handovers, avoiding the throughput cliff of stale min_rtt.  The outlier gate, directional update, and drift correction provide multi-layer defences against T_queue/T_noise contamination.
+- **MIN mode (opt-in, kcc_rtt_mode = 0):** $$model_rtt = min(x_est_us, min_rtt_us)$$ — a **maximin strategy**: take the most conservative estimate to prevent BDP overestimation.  Use when verifying kernel-module stability, or on links known to have truly static RTT.
 
-**Proposition 4 (Conservative BDP Bound).** Under the three-component model with directional Kalman update, the BDP estimate is bounded:
+**Proposition 4 (Conservative BDP Bound — MIN mode).** In MIN mode, under the three-component model with directional Kalman update, the BDP estimate is bounded:
 
 $$\mathrm{BDP_{KCC}} \leq \mathrm{BDP_{true}} + \mathrm{queue\textunderscore bdp\textunderscore margin}$$
 
@@ -1856,20 +1964,20 @@ The process noise Q models T_prop as a random walk with step variance Q per obse
 
 $$Q_base = (σ_RTT × kalman_scale)² / 1e6 = (10 × 1024)² / 1,000,000 = 104,857,600 / 1,000,000 = 104.86 ≈ 105$$
 
-Rounded to Q = 100 for computational simplicity (power-of-ten, clean Riccati arithmetic). The rounding error is 4.86%, well within the adaptive range — Q is internally scaled by max(q_min_factor, min_rtt_us/1000), so the base value is an initial condition, not a critical constant. Q and R serve as initial conditions for the adaptive estimator. The stability theorems hold for ALL finite Q, R > 0. Specific values affect convergence SPEED, not convergence EXISTENCE. At Q=100, R=400: p_ss = (Q + √(Q² + 4QR))/2 = (100 + √(10000 + 160000))/2 = (100 + 412.3)/2 = 256, K_ss = 256/(256+400) = 0.39. The nominal Q=100 also provides a physical prior: path latency drift (fiber thermal expansion, LEO satellite Doppler) at ~10⁻⁵ to 10⁻⁴ of path length per second yields ~0.1–1 µs/s on a 10 ms RTT. Q=100 balances tracking capability (can follow a 100 ms path change in ~10 s) against noise rejection (does not follow sub-µs jitter).
+Rounded to Q = 100 for computational simplicity (power-of-ten, clean Riccati arithmetic). The rounding error is 4.63%, well within the adaptive range — Q is internally scaled by max(q_min_factor, min_rtt_us/1000), so the base value is an initial condition, not a critical constant. Q and R serve as initial conditions for the adaptive estimator. The stability theorems hold for ALL finite Q, R > 0. Specific values affect convergence SPEED, not convergence EXISTENCE. At Q=100, R=400: p_ss = (Q + √(Q² + 4QR))/2 = (100 + √(10000 + 160000))/2 = (100 + 412.3)/2 = 256, K_ss = 256/(256+400) = 0.39. The nominal Q=100 also provides a physical prior: path latency drift (fiber thermal expansion, LEO satellite Doppler) at ~10⁻⁵ to 10⁻⁴ of path length per second yields ~0.1–1 µs/s on a 10 ms RTT. Q=100 balances tracking capability (can follow a 100 ms path change in ~10 s) against noise rejection (does not follow sub-µs jitter).
 
 **Kalman R (default 400):**
-The measurement noise R models inter-ACK RTT measurement noise with σ_meas ≤ 20 µs — a physical hardware bound (bounded by PCIe minimum transaction latency and NIC interrupt coalescing granularity), not a typical value. The derivation at fixed-point scale:
+The measurement noise R models inter-ACK RTT measurement noise using a design-point standard deviation σ_meas ≈ 20 µs — an engineering design value chosen to be representative of wired Ethernet paths (consistent with PCIe transaction latency and NIC interrupt coalescing granularity), not a worst-case hardware bound, typical value, or calibrated measurement.  The derivation at fixed-point scale:
 
 $$R_base = (σ_meas × kalman_scale)² / 1e6 = (20 × 1024)² / 1,000,000 = 419,430,400 / 1,000,000 = 419.43 ≈ 420$$
 
-Rounded to R = 400 for numerical convenience and to produce clean Riccati steady-state values. The rounding is justified by two independent criteria: (1) the 4.9% reduction from 420 is smaller than the adaptation range (R is internally boosted by R_boost = max(0, jitter − jr_thresh) × R / jr_scale), and (2) R = 400 produces K_ss = 0.39 at nominal Q = 100, matching the matched-estimator Riccati solution (Q = 50000, R = 32000 → p_ss ≈ 72170 → K_ss = 0.69) in the mode=1 estimator where the Kalman gain is independently calibrated. The nominal R = 400 is an initial condition; the matched estimator adapts R online via innovation variance tracking.
+Rounded to R = 400 for numerical convenience and to produce clean Riccati steady-state values. The rounding is justified by two independent criteria: (1) the 4.76% reduction from 420 is smaller than the adaptation range (R is internally boosted by R_boost = max(0, jitter − jr_thresh) × R / jr_scale), and (2) R = 400 produces K_ss = 0.39 at nominal Q = 100, matching the matched-estimator Riccati solution (Q = 50000, R = 32000 → p_ss ≈ 72170 → K_ss = 0.69) in the mode=1 estimator where the Kalman gain is independently calibrated. The nominal R = 400 is an initial condition; the matched estimator adapts R online via innovation variance tracking.
 
 **p_est_init (default 1000):**
 Initial error covariance. Must be large enough to make K_init ≈ 1 (full trust in first sample), small enough to converge quickly. Derivation: K_init = p_est_init / (p_est_init + 400). With p_init=1000, K_init ≈ 0.71 — over 70% of the first RTT innovation enters the estimate. p_est_init = max(1000, rtt_us / 10) ensures proportional initialization for long-RTT paths.
 
 **p_est_floor (default 10):**
-Lower bound on error covariance. Prevents the Kalman filter from becoming overconfident (K → 0). With p_est=10, R=400, K_min = 10/(10+400) ≈ 0.024 — the filter always retains at least 2.4% responsiveness to new information. Prevents filter "death" (permanently ignoring measurements).
+Lower bound on error covariance. Prevents the Kalman filter from becoming overconfident (K → 0). With p_est=10, R=400 (nominal), K_min = 10/(10+400) ≈ 0.024 — the filter retains at least 2.4% responsiveness at nominal measurement noise.  At adaptive R (up to 32000 in matched-estimator mode), K_min = 10/(10+32000) ≈ 0.00031 (0.031%).  The key stability invariant is K_min > 0, not any specific percentage — a non-zero gain ensures the filter never "dies" (permanently ignores measurements), but responsiveness at high adaptive R is substantially lower than at nominal R.
 
 **K_ss (steady-state Kalman gain, derived ~0.39-0.88):**
 From the Riccati equation: p_ss = (Q + sqrt(Q² + 4QR))/2 (PREDICTED steady-state covariance). Steady-state balance: p_ss = p_ss·R/(p_ss+R) + Q → p_ss² − Q·p_ss − Q·R = 0 → p_ss = (Q + sqrt(Q² + 4QR))/2. With nominal defaults Q=100, R=400: p_ss = 256, K_ss = 256/(256+400) = 0.39. With adaptive Q=2500, R=400: p_ss ≈ 2851, K_ss = 2851/3251 = 0.88. With matched estimator (Q=50000, R=32000): p_ss ≈ 72170, K_ss = 72170/(72170+32000) = 0.69. K_ss < 1 always (strict) for any finite Q,R > 0.
@@ -1897,11 +2005,13 @@ Scale divisor converting excess jitter to measurement noise boost R_boost. The a
 
 $$R_{\text{adaptive}} = R_{\text{base}} + \max(0,\; \mathrm{jitter\textunderscore ewma} - \tau_{\text{thresh}}) \times R_{\text{base}} / \mathrm{kcc\textunderscore jitter\textunderscore r\textunderscore scale}$$
 
-where τ_thresh is the dynamic clean threshold (10% of min_rtt, floored at 500 µs). Derivation: at the maximum bounded jitter of 5 ms on a path with min_rtt = 10 ms (τ_thresh = 1000 µs), the excess jitter is 4000 µs. With R_base = 400:
+where τ_thresh is the dynamic clean threshold (10% of min_rtt, floored at 500 µs). Derivation: at the maximum bounded jitter of 5 ms on a path with min_rtt = 10 ms (τ_thresh = 1000 µs), the excess jitter is 4000 µs. With R_base = 400 (derived from the design-point measurement noise standard deviation σ_meas ≈ 20 µs for wired Ethernet paths — a performance-oriented nominal value, not a worst-case hardware bound):
 
 $$R_{\text{boost}} = 4000 \times 400 / 8000 = 200 \quad\Rightarrow\quad R_{\text{total}} = 600$$
 
-$$K_{ss} = p_{ss}/(p_{ss} + 600) = 256/856 \approx 0.30$$
+$$K_{ss} = p_{ss}/(p_{ss} + 600) = 300/900 \approx 0.333$$
+
+(The Riccati steady state must be re-solved at the boosted R: at Q=100, R=600, p_ss = (100 + √(10000 + 240000))/2 = 300, not 256.  Using the stale p_ss=256 from nominal R=400 with boosted R=600 would give the incorrect K_ss=0.30.)
 
 This maintains K_ss within the stable range (K_ss > 0.024 from p_est_floor constraint). The divisor 8000 is chosen so that at the hardware noise ceiling (σ_meas ≈ 20 µs, from which R_base = 400 is derived), the R_boost contribution is negligible (< 1 unit) — the adaptive R mechanism activates only for pathologically noisy conditions exceeding the design assumption by 8× or more.
 
@@ -1938,7 +2048,7 @@ Every boundary condition KCC can encounter is enumerated and proven either corre
 | B1 | Queue never drains (p_clean=0) | Directional update skips all; x_est frozen at last clean estimate. min_rtt_us provides BDP floor. Drift Tier 2 (after 128 skips, P<2^-128) force-corrects upward. Any CC algorithm faces this limit. |
 | B2 | Always clean (p_clean=1) | Converges at full rate: E[error] ≤ (1-K_ss)^k; 1% error in ~10 RTTs. |
 | B3 | Path increase (50→100ms) | Positive skips dominate. Three mechanisms: (a) Drift Tier 1 (quiet): 16 skips, corr/4, converges ~26s. (b) Drift Tier 2 (noisy): 128 skips, P<2⁻¹²⁸, corr/8 per cycle. (c) Smart recalibration: p_est grows → PROBE_RTT drains → remeasures min_rtt → convergence within one PROBE_RTT interval (10s). Transient cwnd=½ BDP → conservative, no overshoot. |
-| B4 | Path decrease (100→50ms) | Negative ν accepted: x_{k+1}=x_k+K_ss·(-50ms). Correction=19.5ms/RTT at K_ss=0.39. 1% convergence in ~3-4 RTTs. Transient cwnd=2x BDP → 0.5 BDP queue → drained by next 0.75x phase. No loss. Theorem 4 bounded. |
+| B4 | Path decrease (100→50ms) | Negative ν accepted: x_{k+1}=x_k+K_ss·(-50ms). Correction=19.5ms/RTT at K_ss=0.39. 1% convergence in ~10 RTTs. Transient cwnd=2x BDP → 0.5 BDP queue → drained by next 0.75x phase. No loss. Theorem 4 bounded. |
 | B5 | Extreme RTT initialization | Satellite (1s): x_est=1M*1024=1.02B < U32_MAX. Datacenter (1μs): floored to 1*1024=1024. Both within u32 range. |
 
 **T_queue Boundaries:**
@@ -2067,6 +2177,8 @@ $$
 
 This is a PHYSICAL INFORMATION LIMIT: $T_{\text{prop}}$ and $T_{\text{queue}}$ are summed in a single scalar observable.  Without at least one sample where $T_{\text{queue}} = 0$, they are algebraically inseparable.
 
+**Critical implication for persistent congestion.**  In the **standing-queue regime** — a pathological but physically possible scenario where a fixed set of greedy senders sustains a permanent bottleneck queue ($T_{\text{queue}}(k) > 0$ for all $k$) — the scalar RTT observable cannot distinguish $T_{\text{prop}}$ from $T_{\text{queue}}$.  This is not an implementation flaw, a parameter-choice error, or a proof gap.  It is a **theorem** about the information-theoretic limit of any endpoint-only RTT-based CCA.  KCC's directional gate, Kalman filter, and drift-correction mechanisms provide **bounded graceful degradation** (Theorem K.2 below) — the estimation error is bounded, and three independent recovery mechanisms (DRAIN, PROBE_RTT, drift correction) drive the system back toward the clean-sample regime.  But in the worst-case standing-queue scenario with the default configuration (FILTER mode, PROBE_RTT decoupling active), KCC relies on drift correction alone, which converges more slowly than a BBR-like periodic PROBE_RTT drain.  This is a deliberate engineering tradeoff: default KCC prioritises throughput stability (no periodic PROBE_RTT cliff) over worst-case standing-queue recovery speed.  Operators on known standing-queue paths can set `kcc_probe_rtt_decouple = 0` to restore periodic PROBE_RTT probing.
+
 **Proof.**  The observed RTT is $y = T_{\text{prop}} + T_{\text{queue}}$.  Two unknowns $\{T_{\text{prop}}, T_{\text{queue}}\}$ from one scalar $y$.  The Fisher Information Matrix is:
 
 $$
@@ -2099,13 +2211,13 @@ $$
 
 KCC provides three INDEPENDENT mechanisms that bound the starvation error:
 
-**(a) PROBE_BW DRAIN phase.**  Every PROBE_BW gain cycle includes a DRAIN phase with pacing_gain $= 0.5$, lasting at least `KCC_DRAIN_TARGET_MAX_RTTS` RTTs.  During DRAIN:
+**(a) PROBE_BW DRAIN phase.**  Every PROBE_BW gain cycle includes a DRAIN phase with pacing_gain $= 0.75$ (BBR's 3/4 drain gain, unchanged in KCC), lasting at least `KCC_DRAIN_TARGET_MAX_RTTS` RTTs (default 4).  During DRAIN:
 
 $$
-\frac{dq}{dt} = C \cdot (\text{gain} - 1) = C \cdot (0.5 - 1) = -0.5C
+\frac{dq}{dt} = C \cdot (\text{gain} - 1) = C \cdot (0.75 - 1) = -0.25C
 $$
 
-Queue drained per cycle: $\Delta q = 0.5 \cdot C \cdot 3 \cdot \text{RTT}$.  At 10 Gbps with 100 ms RTT: $\Delta q = 0.5 \times 1.25\,\text{GB/s} \times 0.3\,\text{s} \approx 187.5\,\text{MB}$, far exceeding typical buffer sizes.
+Queue drained per cycle: $\Delta q = 0.25 \cdot C \cdot \text{RTT}_{\text{drain}}$.  With the 4-RTT safety timeout: $\Delta q = 0.25 \cdot C \cdot 4 \cdot \text{RTT} = C \cdot \text{RTT} = \text{BDP}$.  At 10 Gbps with 100 ms RTT: $\Delta q \approx 125\,\text{MB}$, exceeding typical buffer sizes.  The KCC FSM DRAIN state (entered after STARTUP completion) uses the more aggressive `kcc_drain_gain = 0.347` with ${dq}/{dt} = -0.653C$, draining the STARTUP queue faster — the 0.75× PROBE_BW drain is the steady-state worst case.  Both gains satisfy ${dq}/{dt} < 0$, guaranteeing monotonic queue drain.
 
 **(b) PROBE_RTT window.**  Every `KCC_PROBE_RTT_CYCLES`, KCC enters a `KCC_PROBE_RTT_DUR` = 200 ms window with:
 
@@ -2644,7 +2756,7 @@ I(T_prop, T_queue) = (1/σ²)·[1 1; 1 1] — rank 1 → CRB infinite for indivi
 
 **Graceful degradation (KCC mechanisms):**
 
-1. **PROBE_BW DRAIN:** Every BBR gain cycle contains a DRAIN phase (gain = 0.5, ≥3 RTTs). dq/dt = -0.5C, draining ~187.5 MB at 10 Gbps × 100 ms RTT — FAR exceeding typical buffers (0.5–16 MB).
+1. **PROBE_BW DRAIN:** Every BBR gain cycle contains a DRAIN phase (gain = 0.75, ≥1 RTT; KCC safety timeout 4 RTTs). dq/dt = -0.25C, draining ~125 MB at 10 Gbps × 100 ms RTT — FAR exceeding typical buffers (0.5–16 MB).
 
 2. **PROBE_RTT window (200 ms):** Forced idle window guarantees queue drain of C·200 ms bytes regardless of prior congestion.
 
@@ -2657,7 +2769,7 @@ BDP inflation ≤ 1 + min(C·200 ms, T̂_prop/128) / T_prop
 
 | Scenario | T_prop | C | Inflation | Mechanism |
 |----------|--------|-------|-----------|-----------|
-| 10 Gbps, 10 ms RTT | 10 ms | 10 Gbps | 1 + 125 ms / 10 ms = 1 + 12.5 = 13.5× | PROBE_RTT (C/10) |
+| 10 Gbps, 10 ms RTT | 10 ms | 10 Gbps | 1 + 100 ms / 10 ms = 1 + 10 = 11× | PROBE_RTT (C/10) |
 | 100 Mbps, 50 ms RTT | 50 ms | 100 Mbps | 1 + 1.25 MB / 50 ms = negligible | PROBE_RTT |
 | WAN, PROBE_RTT disabled | 10 ms | — | 1 + 1/128 ≈ 1.008× (negligible) | Tier-2 drift |
 
@@ -2779,7 +2891,7 @@ The MSE of the directional (filtered) estimator is $$MSE_{\text{dir}} = \sigma^2
 
 $$\text{bias}_N = K_{ss} \cdot q \cdot N$$
 
-With K_ss=0.39, q=1ms, N=1000: bias = 390ms — catastrophic. The sign-based directional gate correctly rejects ALL positive innovations regardless of magnitude, achieving what magnitude-based gating cannot: zero queue contamination of x_est. The drift detector (persistence-based) provides the statistically rigorous escape hatch for genuine baseline drift: after 128 consecutive positive innovations (P≈2.9×10⁻³⁹ under i.i.d. symmetric noise — statistical certainty of baseline drift), a dampened update (corr/8) is applied. The two mechanisms operate on different timescales: gate is per-sample instantaneous rejection; drift is per-128-samples statistical detection (Wald's SPRT optimality theorem).
+With K_ss=0.39, q=1ms, N=1000: bias = 390ms — catastrophic. The sign-based directional gate correctly rejects ALL positive innovations regardless of magnitude, achieving what magnitude-based gating cannot: negligible queue contamination of x_est. The drift detector (persistence-based) provides the statistically rigorous escape hatch for genuine baseline drift: after 128 consecutive positive innovations (P≈2.9×10⁻³⁹ under i.i.d. symmetric noise — statistical certainty of baseline drift), a dampened update (corr/8) is applied. The two mechanisms operate on different timescales: gate is per-sample instantaneous rejection; drift is per-128-samples statistical detection (Wald's SPRT optimality theorem).
 
 **AND-gate DRAIN timeout:** The $$KCC_DRAIN_TARGET_MAX_RTTS = 4$$ timeout is the **dwell-time condition** in the switched-system stability proof (Liberzon 2003, Theorem 3.1). The PROBE_BW cycle (probe at 1.25×, drain at 0.75×, cruise at 1.0×) is a switched system requiring minimum dwell time per mode. The timeout provides this guarantee — it does not "overturn optimality." The fluid model includes arbitrary cross-traffic: `q_{k+1} = max(0, q_k + Σλ_i − C)`, where Σλ_i includes ALL flows (KCC and cross-traffic). The forced timeout guarantees exit within 4 RTTs regardless of queue state. The PROBE_BW cycle is zero-sum over each 8-phase period: 0.25 BDP of probe-induced queue is drained by the 0.75× drain phase, proving ISS with respect to bounded cross-traffic (Theorem 5).
 
@@ -3893,19 +4005,19 @@ This cap is conservative: it allows legitimate jitter estimates up to the connec
 
 **Problem Statement.** The BBR STARTUP phase exits when bandwidth growth falls below 25% for 3 consecutive non-app-limited round trips. BBR has no time-based safety timeout — a connection that remains app-limited (or experiences persistent minor bandwidth growth < 25%) can stay in STARTUP indefinitely. While correct for the bandwidth-probing objective, this creates a degenerate operational state when combined with KCC's Kalman filter: STARTUP's aggressive pacing gain (2.89×) fills any queue, preventing clean RTT samples from reaching the Kalman filter, which then saturates as described in Proof S1.
 
-**Bounding Argument.** During STARTUP, cwnd approximately doubles each RTT:
+**Bounding Argument.** During STARTUP, the pacing gain is 2.89× ($= e·\ln(2)$, the Cardwell et al. high_gain).  The doubling model (2× per RTT) used below is deliberately conservative — actual growth is faster, making the derived safety margin a lower bound:
 
-$$cwnd^{(k)} \approx cwnd^{init} \times 2^{k}$$
+$$cwnd^{(k)} \geq cwnd^{init} \times 2^{k}$$
 
 For any physical Internet path, the BDP (in packets) is bounded by:
 
 $$BDP_{max} = \frac{C \cdot min\_rtt}{MSS} = \frac{100 \times 10^{9} \cdot 0.2}{1500 \times 8} \approx 1.67 \times 10^{6}\ \text{packets}$$
 
-With $cwnd^{init} = 10$, the STARTUP doubles exceed this after:
+With $cwnd^{init} = 10$, the slower doubling model exceeds this after:
 
 $$N = \log_2\left(\frac{BDP_{max}}{cwnd^{init}}\right) \approx \log_2(1.67 \times 10^{5}) \approx 18\ \text{RTTs}$$
 
-Applying a $2\times$ safety margin for real-world imperfections (transient loss, uneven ACK patterns, variable cross-traffic): $N_{safe} = 2 \times 18 = 36$ RTTs. Setting the default at $64$ RTTs provides a $\approx 3.5\times$ safety margin above the theoretical physical maximum.
+(With the actual 2.89× gain, N ≈ log_{2.89}(1.67×10⁵) ≈ 12 RTTs — the doubling model is a conservative bound.)  Applying a $2\times$ safety margin for real-world imperfections (transient loss, uneven ACK patterns, variable cross-traffic): $N_{safe} = 2 \times 18 = 36$ RTTs. Setting the default at $64$ RTTs provides a $\approx 3.5\times$ safety margin above the theoretical physical maximum under the conservative doubling model, and a $5.3\times$ margin under the actual 2.89× growth rate.
 
 **Correction.** When a connection is in STARTUP mode, `full_bw_reached` is still 0, and `rtt_cnt` reaches the timeout threshold (at a round boundary on a non-app-limited sample):
 
@@ -4365,7 +4477,7 @@ The truncated Kalman filter is sometimes challenged by proposals of alternative 
 | 4. H∞ filter | Symmetric conservatism, loses signal sensitivity | DOMINATED |
 | 5. EWMA + heuristics | No process model, no optimality, no uncertainty | STRUCTURALLY INFERIOR |
 
-The truncated Kalman filter is the UNIQUE estimator that simultaneously achieves MMSE optimality on the informative half-space, structural rejection of queue contamination, uncertainty quantification, process noise modeling, and O(1) per-sample cost.
+The truncated Kalman filter is the UNIQUE estimator that simultaneously achieves conditional minimum-variance on the informative half-space (gate-accepted samples), structural rejection of queue contamination, uncertainty quantification, process noise modeling, and O(1) per-sample cost.
 
 ---
 
