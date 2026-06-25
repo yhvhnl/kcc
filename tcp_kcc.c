@@ -482,7 +482,8 @@
  *         −σ·√(2/π) · K_ss < 0 → downward bias on T_prop, which is
  *         CONSERVATIVE (safe).  The 3-component model does not eliminate
  *         all false positives — it converts them into SAFE, downward-
- *         biased estimate adjustments that never inflate T_prop.
+ *         biased estimate adjustments that structurally resist inflating T_prop
+ *         (force-accept mechanism provides bounded exception for stall prevention).
  *
  *       CONCLUSION:  No 2-component model can separate congestion-driven
  *       RTT increases from noise-driven RTT increases; the conflated
@@ -2696,7 +2697,7 @@
  *   is not a pure Kalman filter — it is a Kalman-structured estimator
  *   with nonlinear gating.  All theorems below account for this.
  *
- *   Theorem 1 (Lyapunov Global Asymptotic Stability).
+ *   Theorem 1 (Lyapunov Global Asymptotic Stability) [Historical — superseded by Theorem C.1].
  *     System state at round k: s_k = (q_k, x_k) where q_k >= 0 is queue
  *     (bytes) and x_k is the Kalman estimate of T_prop.
  *     Discrete dynamics at cruise gain 1.0x:
@@ -2901,7 +2902,7 @@
  *
  *   Corollary (N-flow Fairness).
  *     For N KCC flows sharing a bottleneck, all flows converge to rate_i = C/N
- *     regardless of kcc_rtt_mode (FILTER or MIN).  Fairness arises from symmetric
+ *     regardless of kcc_rtt_mode (BBR, FILTER, or MIN).  Fairness arises from symmetric
  *     PROBE_BW gain cycling + directional gate, neither of which involves model_rtt
  *     (which affects cwnd ceiling, not pacing rate).  Global KF (kcc_kf_enable=1)
  *     accelerates convergence via shared bandwidth seeding but is not required.
@@ -3346,7 +3347,7 @@
  *         alpha_O = 0.985 * (1 - 0.110) = 0.877 = K (as proved: alpha_O = K)
  *         sigma_O = 0.877^2 * (1 + 2.28) = 0.769 * 3.28 = 2.52
  *
- *       Note: alpha_O approximately equals K_ss in both cases.
+ *       Note: alpha_O equals K_ss in both cases.
  *       This is exact: alpha_O = (2K-K^2)*(1 - (1-K)/(2-K))
  *                              = (2K-K^2) * 1/(2-K) = K.
  *       So the observer Lyapunov decay rate IS the Kalman gain K_ss.
@@ -3412,7 +3413,7 @@
  *     Controller ISS-gain: ||delta||_inf <= gamma_C * ||e||_inf
  *     with gamma_C = 1.25*C/MSS.
  *
- *     Controller Lyapunov function (from Theorem 1):
+ *     Controller Lyapunov function (from Theorem C.1):
  *       V_C(q_k, cwnd_k) = (q_k/C)^2/2 + beta*(cwnd_k - BDP_seg)^2/2
  *
  *     Over the 8-phase dwell-time cycle, the PROBE_BW controller is a
@@ -3448,7 +3449,7 @@
  *     Net cycle V_C decrease derivation:
  *       The probe/drain pair produces symmetric V_C excursions that
  *       cancel to first order.  The net contraction comes from the
- *       observer's per-round decay rate alpha_O = K_ss*(2 - K_ss)
+ *       observer's per-round raw decay rate kappa_O = K_ss*(2 - K_ss)
  *       acting through the cwnd deviation over the full cycle.
  *
  *       Over N_cycle = 8 phases, the effective per-cycle decay is:
@@ -3461,14 +3462,14 @@
  *
  *     Explicit computation of rho:
  *       K_ss = 0.39 (nominal steady-state Kalman gain)
- *       alpha_O = K_ss * (2 - K_ss) = 0.39 * 1.61 = 0.6279
+ *       kappa_O = K_ss * (2 - K_ss) = 0.39 * 1.61 = 0.6279
  *       1 - rho = 0.6279 / 8 = 0.0785
  *       rho = 1 - 0.0785 = 0.9215 ~ 0.92
  *
  *     Therefore: V_C(k+8) <= rho * V_C(k) with rho = 0.92 < 1.
  *
  *     Verification at adaptive K_ss = 0.88 (high-jitter regime):
- *       alpha_O = 0.88 * 1.12 = 0.986
+ *       kappa_O = 0.88 * 1.12 = 0.986
  *       rho = 1 - 0.986/8 = 1 - 0.123 = 0.877 < 0.92 (faster)
  *
  *     Worst case (K_ss -> 0, very low noise): rho -> 1 (slow but stable).
@@ -3848,7 +3849,7 @@
  *       μ(phase, σ) = μ_0 + (1 - μ_0) · (1 - σ) · 𝟙(phase ∈ (Cruise))
  *
  *     with base weights λ_0 = 0.39 = K_ss (steady-state Kalman gain)
- *                         μ_0 = 0.15 ≈ K_ss · (1 - K_ss) (cross-term residual)
+ *                         μ_0 = K_ss² ≈ 0.15  (cross-term residual, K_ss=0.39)
  *
  *     In PROBE_BW/DRAIN:  q_k grows → σ → 1 → λ → 1, μ → μ_0
  *       (queue-energy term dominates: safe because bounded by 2×BDP)
@@ -4046,7 +4047,8 @@
  *
  * S_1 (Observer): ‖x̃_k‖ ≤ β_O(‖x̃_0‖, k) + γ_O(‖q‖_∞, ‖w_O‖_∞)
  *   ΔV_O(e_k) ≤ −α_O·V_O(e_k) + σ_1·|q_k|² + σ_2·‖w_O‖²
- *   with α_O = 2K − K² − ε·K² > 0 (verified for K_ss = 0.39)
+ *   with α_O = K_ss (Young-adjusted, §5.3: (2K−K²)·1/(2−K) = K;
+ *   at K_ss=0.39: α_O=0.39, at K_ss=0.88: α_O=0.88)
  *
  * S_2 (Controller): ‖u_k‖ ≤ β_C(‖u_0‖, k) + γ_C(‖x̃‖_∞, ‖w_C‖_∞)
  *   The PROBE_BW controller is BIBO-stable by design: cwnd_k ∈ [cwnd_min, cwnd_max]
@@ -4059,7 +4061,9 @@
  *   If S_1, S_2 are ISS and the interconnection satisfies small-gain
  *   γ_S2·γ_S1 < 1, then the cascade (rate→queue→estimate→rate) is ISS.
  *
- *   With KCC parameters: γ_S1 = γ_O < 1 (from ΔV_O), γ_S2 = K_ss < 1
+ *   With KCC parameters: γ_S1 = K_ss < 1 (observer ISS gain, from ΔV_O),
+ *   effective loop gain γ_loop = K_ss < 1 (cascade product with
+ *   per-phase MSS cancellation — exhaustive analysis §5.7).
  *   (from Kalman contraction), γ_cascade = γ_S2·γ_S1 < 1 ✓
  *
  * The directional gate "opens the loop" during congestion (γ_RTT→x = 0
@@ -4157,7 +4161,8 @@
  *     Each subsystem satisfies an ISS-Lyapunov dissipation inequality
  *     with respect to its input disturbances.  For S_1 (observer):
  *       ΔV_O ≤ −α_O·V_O + σ_O·‖(q/C, η_k)‖²
- *     with α_O = 2K − K² (verified α_O = K_ss exactly).
+ *     with α_O = K_ss (Young-adjusted from raw κ_O = 2K−K²:
+ *     α_O = (2K−K²)·(1−(1−K)/(2−K)) = (2K−K²)·1/(2−K) = K).
  *
  *     For S_2 (controller, cycle-averaged over 8 phases):
  *       ΔV_C ≤ −α_C·V_C + σ_C·‖e‖²
@@ -4188,12 +4193,13 @@
  *       α_effective = min(1.0, 0.39×0.639/1.639, 0.08×1.0/2.0) / 2
  *                    = min(1.0, 0.152, 0.04) / 2 = 0.02
  *
- *       γ_cross = max(γ_S1·γ_P, γ_S2·γ_S1)
- *               = max(K_ss·MSS/C, (1.25·C/MSS)·K_ss)  [probe blocked]
- *       Expand γ_S2·γ_S1 = K_ss·(1.25·C/MSS).  Under probe-blocked
- *       regime, the controller's probe gain γ_S2 is limited by the
- *       directional Kalman gate to γ_S2' = 1/(1.25·C/MSS) ≈ MSS/C,
- *       giving γ_S2'·γ_S1 = (MSS/C)·K_ss, which matches γ_S1·γ_P.
+ *       γ_cross = max(γ_S1·γ_P, γ_eff) where γ_eff is the
+ *       phase-dependent effective loop gain (exhaustive per-phase
+ *       analysis §5.7).  At cruise: γ_S2=1·C/MSS, giving
+ *       γ_S2·γ_S1 = K_ss·C/MSS.  The MSS factor cancels through the
+ *       plant (q-to-cwnd: C/MSS, cwnd-to-q: MSS/C), yielding
+ *       γ_eff = K_ss < 1 in all regimes.  Therefore:
+ *       γ_cross = max(K_ss·MSS/C, K_ss) = K_ss < 1.  [§5.7 exhaustive]
  *       Both terms converge to K_ss·MSS/C ≪ 1, but the cascade
  *       composition (Jiang & Mareels 1997, Thm 2.1) applies the
  *       stronger subsystem gain γ_S1 = K_ss as the composite bound:
@@ -4359,7 +4365,7 @@
  *       - The full closed loop (Theorem 5: switched ISS + dwell-time)
  *
  *     This scope delimitation is RIGOROUS and precisely stated at
- *     Proof G.1 (lines 12687-12827), where the Lur'e sector-bounded
+ *     Proof G.1 (lines 13029-13190), where the Lur'e sector-bounded
  *     nonlinearity φ ∈ [0, 1] models the receiver's ACK generation
  *     policy (delayed-ACK, GRO, LRO).  The full closed-loop stability
  *     is established separately via Theorem 5 (ISS Cascade with
@@ -4482,7 +4488,8 @@
  *   KCC maintains two independent T_prop estimates:
  *     Estimate 1: Kalman x_est (directional, defensive).  Updated only
  *       on RTT decreases.  On persistent-queue paths, x_est converges
- *       downward to true T_prop, never upward to queue-inflated values.
+ *       downward to true T_prop, structurally resisting upward inflation through
+ *       the directional gate (force-accept provides bounded exception).
  *     Estimate 2: Windowed min_rtt_us (aggressive floor).  Updated on
  *       every RTT sample that beats the current minimum.  Provides a
  *       guaranteed floor preventing x_est from drifting below reality.
@@ -4634,7 +4641,7 @@
  *
  *   Filter Level:     Theorem S.2 (Kalman contraction), Theorem 4 (BIBO)
  *
- *   Cycle Level:      Theorem 1 (Lyapunov PROBE_BW), Theorem 5-§b (switched)
+ *   Cycle Level:      Theorem C.1 (Convergence), Theorem 5-§b (switched)
  *
  *   Multi-Flow Level: Theorem 3 (small-gain), Corollary (N-flow fairness)
  *
@@ -4677,9 +4684,9 @@
  *   | Proof M (BBR Degeneracy) | §Proof M | §Proof M | BBR's 2-comp = degenerate KCC 3-comp; Blackwell dominance |
  *   | Proof K (Clean-Sample Starvation) | §Proof K | §Proof K | Fundamental lower bound on T_prop error |
  *   | Corollary K.1 (Starvation Condition) | §Cor K.1 | §Cor K.1 | If T_queue>ε for all samples, BDP inflated |
- *   | Corollary K.2 (Graceful Degradation) | §Cor K.2 | §Cor K.2 | KCC 3-mechanism composite bound |
+ *   | Theorem K.2 (Graceful Degradation) | §K.2 | §K.2 | KCC 3-mechanism composite bound |
  *   | AIC/BIC (Model Selection Vacuous) | §AIC/BIC | §AIC/BIC | 4-comp likelihood degenerate; selection undefined |
- *   | Theorem 1 (Lyapunov GUAS) | §Thm 1 | §Thm 1 | Replaced: Lemmas O.1-O.3 + Q.1-Q.3 + C.1 → no circular premises |
+ *   | Theorem 1 (Lyapunov GUAS) | — (see tcp_kcc.c) | — (see tcp_kcc.c) | Replaced: Lemmas O.1-O.3 + Q.1-Q.3 + C.1 → no circular premises |
  *   | Lemma Q.1 (DRAIN Monotonic) | §Lemma Q.1 | §Q.1 | dq/dt < 0 strictly ∀ DRAIN phases |
  *   | Theorem S.2 (Contraction) | §Thm S.2 | §S.2 | Rebuilt on ISS: no convergence premise |
  *   | Theorem 3 (Small-Gain) | §Thm 3 | §Thm 3 | ISS cascade: gamma_loop <= K_ss < 1 |
@@ -4704,7 +4711,7 @@
  *   | Boundary Expansion Analysis | §BEA | §BEA | T_trans, observability, Bayesian |
  *   | Proof N (5-Scheme Rebuttal) | §Proof N | §Proof N | All 5 alternatives = special case or dominated |
  *   | Proof O (SIGCOMM'18 Boundary) | §Proof O | §Proof O | Delta_lo tightened by directional update |
- *   | Mathematical Guarantees Table | §MGT | §MGT | 28-row comprehensive proof status |
+ *   | Mathematical Guarantees Table | §MGT | §MGT | 19-row comprehensive proof status |
  *
  * BOUNDARY CONDITION PROOFS
  *
@@ -4732,10 +4739,11 @@
  *     adaptive Q=2500, R=400 → p_ss≈2851 → K=0.88;
  *     matched Q=50000, R=32000 → p_ss≈72170 → K=0.69),
  *     convergence to 1% error in ~10 RTTs.  The directional update
- *     never rejects (all innovations are negative or zero-mean noise).
+ *     rarely rejects beyond the normal sign gate (~50% of symmetric-noise
+ *     innovations are positive and rejected per the directional rule).
  *     x_est → T_prop at the maximum possible rate.  Convergence rate
- *     is maximal, consistent with Theorem 1 (Kalman contraction rate =
- *     K_init / MSS).
+ *     is maximal, consistent with Theorem S.2 (Kalman contraction rate).
+ *     The uncensored filter achieves peak convergence at K_init.
  *
  *   B3. Path change: T_prop increases (BGP reroute 50ms→100ms).
  *     Positive innovations dominate.  Directional update skips them.
@@ -4783,7 +4791,7 @@
  *     qdelay_avg → 0.  ECN backoff disabled (qdelay below threshold).
  *     Drain-skip active (qdelay_avg < clean_thresh).  Gain decay
  *     disabled.  System operates at maximum efficiency: cruise at
- *     BDP, zero standing queue.  Equilibrium proven in Theorem 1.
+ *     BDP, zero standing queue.  Equilibrium proven in Theorem C.1.
  *
  *   B7. Full buffer (q = q_max, physical limit).
  *     qdelay_avg converges to q_max/C * EWMA_weight.  ECN backoff
@@ -4812,7 +4820,7 @@
  *     converges to K_ss ≈ 0.39-0.88 (from actual Q/R defaults),
  *     providing near-optimal convergence rate.  No noise suppression overhead.
  *     This is the degenerate case of the Kalman filter with R at its
- *     floor; Theorem 1 guarantees convergence at the maximal rate K < 1.
+ *     floor; Theorem C.1 guarantees convergence at the maximal rate K < 1.
  *     The absence of noise makes the estimator information-efficient,
  *     consistent with Proof E (Cramér-Rao bound is attainable when the
  *     observation model matches reality).
@@ -4831,7 +4839,7 @@
  *     K_ss ≈ 0.35 (at Q=100, R=525), or ≈ 0.85 with adaptive Q=2500.
  *     Filter operates at moderate gain, with the directional gate
  *     providing structural noise isolation (Proof C).
- *     Convergence rate slows by factor ~0.6 (Theorem S.2, p_clean=0.6).
+ *     Convergence rate slows by factor ~0.5 (Theorem S.2, p_clean=0.5).
  *
  *   B11. Burst noise (isolated spikes, η_spike >> η_background).
  *     Outlier gate rejects spikes exceeding jitter_ewma * mult.
@@ -4894,9 +4902,9 @@
  *     Theorem 4's bounded-output guarantee.
  *
  *   B15. Counter saturation.
- *     (a) sample_cnt: u32, saturated at U32_MAX (L12226: if
+ *     (a) sample_cnt: u32, saturated at U32_MAX (L12351: if
  *     sample_cnt < U32_MAX).  (b) pos_skip_cnt: u8, saturated at
- *     KCC_POS_SKIP_SATURATION (L11972).  (c) consec_reject_cnt:
+ *     KCC_POS_SKIP_SATURATION (L12089).  (c) consec_reject_cnt:
  *     u32, saturated implicitly by comparison with max_consec_reject
  *     (25) — never reaches U32_MAX.  (d) rtt_cnt, cycle_idx, lt_rtt_cnt:
  *     all bounded by their bitfield widths or clamp guards.  No
@@ -4914,7 +4922,7 @@
  *     (complete outage): kcc_bw() returns 0 → pacing_rate = 0 →
  *     connection stalls.  Recovery when BW returns — no state
      *     corruption.  (d) BW → ∞ (infinite theoretical): bw_raw capped
- *     at U64_MAX / USEC_PER_SEC before multiplication (L14152:
+ *     at U64_MAX / USEC_PER_SEC before multiplication (L14289:
  *     bw_raw > U64_MAX / USEC_PER_SEC → bw = U64_MAX).
  *     Why this matters: Ensures the physical bounds assumption (Theorem
  *     5-§2, network plant ISS) is not violated by pathological parameter
@@ -6455,7 +6463,7 @@ static const struct kernel_param_ops kcc_param_ops = {
  *   over the 50ms theoretical minimum. max=15s caps drift budget at 0.6*p_ss
  *   on long-RTT paths. dyn_max=30s (2x safety over max) activates when Kalman
  *   p_est < converged_p_est (filter confident of T_prop); 0 disables.
- * BOUNDS: base/max [1, 3600]; dyn_max [0, 3600] (0 = disabled, use base).
+ * BOUNDS: base/max [1, 86400]; dyn_max [0, 86400] (0 = disabled, use base).
  */
 static int kcc_probe_rtt_base_sec = 10;               /* [T_prop] base PROBE_RTT interval (s); matches kernel BBR's fixed 10s when Kalman unconverged */
 module_param_cb(kcc_probe_rtt_base_sec, &kcc_param_ops, &kcc_probe_rtt_base_sec, 0644); /* [T_prop] sysctl: kcc_probe_rtt_base_sec */
@@ -6476,7 +6484,7 @@ module_param_cb(kcc_probe_rtt_dyn_max_sec, &kcc_param_ops, &kcc_probe_rtt_dyn_ma
  *   Ensures pacing_win = cwnd_gain * pacing_rate covers BDP + max expected
  *   queue depth from probe-adapt transients.
  * BOUNDS: num [0, 100000], den [1, 100000]; net multiplier clamped at KCC_GAIN_MAX;
- *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L8655).
+ *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L8795).
  */
 static int kcc_cwnd_gain_num = 2;                     /* [T_queue] CWND gain numerator for PROBE_BW; 2x BDP default; num/den*BBR_UNIT */
 module_param_cb(kcc_cwnd_gain_num, &kcc_param_ops, &kcc_cwnd_gain_num, 0644); /* [T_queue] sysctl: kcc_cwnd_gain_num */
@@ -6609,7 +6617,7 @@ module_param_cb(kcc_cycle_decay_mask, &kcc_gain_array_ops, &__param_arr_kcc_cycl
  * minimum transaction latency and NIC interrupt coalescing granularity,
  * not a typical value).
  * R_base = (20 * 1024)^2 / 1,000,000 ≈ 420, rounded to 400 for
- * numerical convenience and to match Q=100 in the Riccati steady-state
+ * numerical convenience and to match Q=100 in the §Riccati Steady State
  * (p_ss = 256 from p_ss = (Q + sqrt(Q^2 + 4*Q*R))/2 at Q=100,R=400;
  *  K_ss = p_ss/(p_ss+R) = 256/(256+400) ≈ 0.39; note p_ss=256 coincides
  *  numerically with BBR_UNIT=256 but is an independent Kalman covariance).
@@ -6780,9 +6788,10 @@ module_param_cb(kcc_kalman_p_est_max, &kcc_param_ops, &kcc_kalman_p_est_max, 064
  * near-certain predictor.
  *
  * The runtime threshold kcc_kalman_converged_val is computed as:
- *   p_est_thresh ≈ K_thresh * R_kcc = (ppm/1e6) * (R_base * scale²)
- * At default ppm=1, R_base=400, scale=1024:
- *   p_est_thresh ≈ 1e-6 * 400 * 1048576 ≈ 419
+ *   p_pred_thresh = K_thresh * R_kcc = (ppm/1e6) * (R_base * scale²)
+ *   p_est_thresh  = p_pred_thresh − Q  (subtract process noise)
+ * At default ppm=1, R_base=400, scale=1024, Q=100:
+ *   p_pred ≈ 1e-6 * 400 * 1048576 ≈ 419, p_est = 419 − 100 = 319
  * This preserves the effective behavior of the former hard-coded threshold
  * (p_est ≤ 500 at R=400 → K ≤ 1.2 ppm) while making the convergence criterion
  * endogenous to the filter's own parameters.
@@ -6922,8 +6931,8 @@ module_param_cb(kcc_kf_steady_mode, &kcc_param_ops, &kcc_kf_steady_mode, 0644); 
 /*
  * PHYSICS: Maximum physical RTT sample accepted by the Kalman filter; values above this are discarded.
  * UNITS: Microseconds (µs); compared directly against raw RTT measurement from TCP timestamp.
- * DERIVATION: ceiled from (U32_MAX / kalman_scale) / 2 ≈ 2,100,000 µs; lowered to 500 ms to reject route-flap spikes while allowing satellite paths (600 ms via kcc_kalman_rtt_dyn_mult = 2 → 1.2s); README.md L3793.
- * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (tcp_kcc.c L8427).
+ * DERIVATION: ceiled from (U32_MAX / kalman_scale) / 2 ≈ 2,100,000 µs; lowered to 500 ms to reject route-flap spikes while allowing satellite paths (600 ms via kcc_kalman_rtt_dyn_mult = 2 → 1.2s); §Module Parameters.
+ * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8604).
  * [T_noise] kcc_rtt_sample_max_us -- RTT samples exceeding this value are discarded
  * by the Kalman filter to prevent extreme outliers from distorting x_est.
  * Default 500,000 us = 500 ms.
@@ -7470,8 +7479,8 @@ module_param_cb(kcc_alone_exit_thresh, &kcc_param_ops, &kcc_alone_exit_thresh, 0
  * Derivation: The value 1024 (= 2^10) is chosen to provide 10 bits of fractional precision in fixed-point RTT representation. With this scale: (a) a 1-second RTT fits as 1,024,000 < U32_MAX, (b) quantisation error is <= 0.5/1024 = 0.05% of the measured RTT, which is bounded above by the Kalman measurement noise variance R and therefore does not contribute an independent error term, (c) the scale_shift = ilog2(1024) = 10 enables division-by-1024 via >> 10, and (d) squared terms (innov_sq, keps_sq) remain within u64 bounds since (U32_MAX * 1024)^2 / 1024^2 = U32_MAX^2 < U64_MAX.
  * PHYSICS: Fixed-point scaling factor converting physical RTT (µs) to filter-internal integer units.
  * UNITS: Dimensionless multiplier; x_est ∈ [scale, U32_MAX] in scaled units.
- * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision; scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (README.md L1885-1886).
- * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (tcp_kcc.c L8511).
+ * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision; scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (§Parameter Derivation Proofs).
+ * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8652).
  */
 static int kcc_kalman_scale = 1024;                       /* [K] Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [K] sysctl: kcc_kalman_scale */
@@ -7572,58 +7581,133 @@ module_param_cb(kcc_kalman_noise_mode, &kcc_param_ops, &kcc_kalman_noise_mode, 0
 /*
  * [T_prop] kcc_rtt_mode -- Selects the model RTT strategy for BDP calculation.
  *
- * Mode 1 (FILTER, default): use x_est_us directly (the raw Kalman / sliding-
- *      window filter estimate).  Recommended for production WAN / VPS
- *      deployments because:
+ * ── FUNDAMENTAL PHYSICAL CONSTRAINT ──
  *
- *      a) Route-change resilience -- When a BGP reroute increases physical RTT
- *         (e.g., 50 ms → 100 ms), the Kalman gain K_k reacts within a few
- *         RTTs and pulls x_est_us to the new path latency.  MIN mode deadlocks
- *         on the old min_rtt_us (50 ms) until the window expires; BDP is
- *         computed from the stale minimum, effectively cutting the pipe in
- *         half and creating a throughput cliff until the window rotates.
+ *   T_prop_true is a hidden variable.  No endpoint-only RTT-based CCA can
+ *   observe it directly; every estimator produces an APPROXIMATION biased
+ *   in one direction:
  *
- *      b) Built-in defenses -- Outlier gating rejects RTT samples inflated by
- *         queue spikes (CoDel pass-through, ACK compression) before they
- *         enter the innovation step.  Adaptive Q/R noise matching reduces
- *         K_k when measurement noise is high, so the filter's gain naturally
- *         damps during transient bloat and keeps the estimate near the true
- *         propagation delay.
+ *     min_rtt_us  ≥  T_prop_true  ≥  x_est_us
+ *     (BBR window)      (truth)       (directional Kalman)
  *
- *      c) PROBE_RTT decoupling -- FILTER mode computes BDP from x_est_us, not
- *         min_rtt_us, so the periodic PROBE_RTT drain is unnecessary for BDP
- *         accuracy.  The kcc_probe_rtt_decouple mechanism suppresses PROBE_RTT
- *         when the Kalman filter is healthy and reactivates it as an on-demand
- *         safety net when p_est signals divergence.
+ *   min_rtt_us is a 10-second sliding-window minimum.  It equals T_prop
+ *   ONLY if the pipe drained to zero at least once in the window.  Under
+ *   persistent standing queue, min_rtt_us = T_prop + q_residual > truth.
+ *   Under deep-buffer broadband (≥500 ms), the residual can dominate,
+ *   inflating BDP and triggering a vicious cycle: larger cwnd → deeper
+ *   queue → higher min_rtt → larger cwnd.
  *
- *      Result: zero throughput cliffs, no global PROBE_RTT sync collapses,
- *      application-level latency spikes eliminated.
+ *   x_est_us is the directional Kalman posterior.  The Mills-ratio bias
+ *   E[ν | ν < 0] = −σ·√(2/π) ≈ −0.798σ pulls it BELOW truth (safe for CC:
+ *   underestimated BDP → no overshoot).  At typical σ = 1 ms on a 50 ms
+ *   path, the bias is ~1.6% — an acceptable throughput penalty for the
+ *   structural guarantee of never inflating BDP from T_queue.
  *
- * Mode 0 (MIN): return min(x_est_us, min_rtt_us).  Conservative: provides a conservative bound:
- *      BDP inflation less likely beyond the windowed minimum.  Use when verifying
- *      kernel-module stability before switching to FILTER, or on links
- *      where RTT is known to be truly static.
+ *   The gap between min_rtt_us and x_est_us brackets the unknowable truth.
+ *   kcc_rtt_mode selects where in this bracket model_rtt is drawn from.
  *
- * Runtime switch: echo {0,1} > /proc/sys/net/kcc/kcc_rtt_mode
+ * ── MODES ──
+ *
+ * Mode 2 (BBR-pure): model_rtt = min_rtt_us
+ *
+ *   Physics: min_rtt_us is the maximum-likelihood estimator of T_prop
+ *   under one-sided noise, but it is NOT unbiased — it equals truth only
+ *   when T_queue = 0 at least once per 10 s window.  Under sustained
+ *   high-pressure broadband, min_rtt_us is inflated by residual queue,
+ *   producing feedback loop instability (BDP overshoot → deeper queue →
+ *   higher min_rtt → larger BDP overshoot → ...).
+ *
+ *   On mobile (3G/4G/5G), RTT jitter is ~±20 ms.  The windowed minimum
+ *   captures random noise valleys, not physical T_prop.  BDP fluctuates
+ *   wildly with each 10 s window rotation.  DO NOT use on mobile.
+ *
+ *   Valid only on BROADBAND paths where the pipe drains to zero at least
+ *   once per window (light-load, single-flow, or AQM-configured).
+ *
+ * Mode 1 (FILTER, default): model_rtt = x_est_us
+ *
+ *   Physics: x_est_us is the conditional mean of the censored Kalman
+ *   posterior.  The directional gate ν_k ≤ 0 accepts only downward RTT
+ *   innovations, structurally rejecting all upward T_queue contamination.
+ *   When a persistent queue builds, the gate closes and x_est FREEZES at
+ *   its last clean-sample value — providing a stable physical T_prop
+ *   anchor that min_rtt_us cannot provide under high pressure.
+ *
+ *   The Mills-ratio cost (~1.6% throughput on a 50 ms path with 1 ms
+ *   jitter) is the price of the structural guarantee: BDP is never
+ *   inflated from queue.
+ *
+ *   On mobile: the Kalman's adaptive Q/R and outlier gating smooth RTT
+ *   jitter, producing a stable estimate where min_rtt_us oscillates
+ *   wildly.  This is the ONLY mode recommended for mobile networks.
+ *
+ *   On path-INCREASE (e.g., BGP reroute 50→100 ms): directional gate
+ *   rejects positive innovations, so x_est freezes at the old value.
+ *   Recovery paths: (a) drift correction Tier 1/2 provides geometric
+ *   convergence; (b) smart recalibration (p_est > recal_thresh) triggers
+ *   a PROBE_RTT drain to reseed x_est.
+ *
+ * Mode 0 (MIN): model_rtt = min(x_est_us, min_rtt_us)
+ *
+ *   Physics: In steady state, RTT = T_prop + T_queue + T_noise with all
+ *   components ≥ 0.  Hence min_rtt_us ≥ T_prop ≥ E[x_est_us] (Mills bias
+ *   pulls x_est BELOW truth).  Therefore min(x_est, min_rtt) = x_est_us
+ *   in steady state — MIN is IDENTICAL to FILTER at equilibrium.
+ *
+ *   The ONLY scenario where MIN deviates from FILTER is during a PATH-
+ *   IMPROVEMENT transition (RTT decrease, e.g., 100→50 ms):
+ *
+ *     t=0:    min_rtt_us = 50 ms (captures new minimum instantly)
+ *             x_est_us   = 95 ms (Kalman convergence requires ~0.8 s)
+ *             min(50, 95) = 50 ms → MIN recovers instantly
+ *             FILTER = 95 ms → FILTER converges over ~0.8 s
+ *
+ *     t=0.8s: x_est_us → 50 ms → both modes return 50 ms
+ *
+ *   MIN thus provides instant RTT-decrease adaptation (matching BBR-pure),
+ *   while retaining FILTER's T_prop anchor under high pressure.  The cost
+ *   is that on mobile/wireless, min_rtt_us can capture random noise valleys
+ *   below T_prop, producing transient BDP underestimation — exactly the
+ *   scenario that FILTER's Kalman smoothing was designed to eliminate.
+ *   Therefore MIN is recommended for BROADBAND only.
+ *
+ * ── ENGINEERING SUMMARY ──
+ *
+ *   Mode 2 (BBR-pure): broadband light-load only.  min_rtt_us gets closest
+ *     to truth when the pipe drains.  DO NOT use under deep buffers or
+ *     on mobile — min_rtt_us feedback loop is unstable in those regimes.
+ *
+ *   Mode 1 (FILTER, default): the general-purpose mode.  Stable on ALL
+ *     network types (broadband light, broadband high-pressure, mobile,
+ *     satellite).  The 1.6% Mills-ratio throughput penalty is the price
+ *     paid for the structural guarantee of BDP never inflating.
+ *
+ *   Mode 0 (MIN): broadband only.  Identical to FILTER in all steady-state
+ *     regimes (min_rtt ≥ T_prop ≥ x_est, min() selects x_est).  Differs
+ *     only during RTT-DECREASE transients, where min_rtt_us captures the
+ *     new lower value instantly while x_est converges (~0.8 s).  Not
+ *     recommended for mobile (min_rtt_us captures random noise valleys).
+
+ * Runtime switch: echo {0,1,2} > /proc/sys/net/kcc/kcc_rtt_mode
  */
-static int kcc_rtt_mode = 1;                   /* [T_prop] model RTT strategy for BDP calculation: 1=FILTER (default, use x_est_us directly for faster path-change adaptation), 0=MIN (use min(x_est_us, min_rtt_us) for conservative windowed-min clamp); KCC-only: kernel BBR always uses the sliding-window minimum; see block comment for detailed rationale; range [0, 1], BBR default: N/A (BBR always uses windowed min_rtt) */
+static int kcc_rtt_mode = 1;                   /* [T_prop] model RTT source for BDP: 2=BBR (min_rtt_us window, broadband light-load only), 1=FILTER (default, x_est_us Kalman, all network types), 0=MIN (min(x_est, min_rtt), broadband only, degrades to FILTER under pressure); range [0, 2]; see block comment for full physics analysis */
 module_param_cb(kcc_rtt_mode, &kcc_param_ops, &kcc_rtt_mode, 0644); /* [T_prop] sysctl: kcc_rtt_mode */
 /*
- * [T_prop] kcc_probe_rtt_decouple -- When kcc_rtt_mode == FILTER (1), replaces the
- *      periodic PROBE_RTT "self-mutilation" cycle with a smart Kalman-health
- *      criterion.
+ * [T_prop] kcc_probe_rtt_decouple -- Replaces the periodic PROBE_RTT
+ *      "self-mutilation" cycle with a smart Kalman-health criterion.
+ *      Independent of kcc_rtt_mode (works in all modes: BBR/FILTER/MIN).
  *
  * BBRv1's PROBE_RTT is a necessary evil for the window-based min_rtt
  * approach -- the window cannot track true propagation delay unless the pipe
- * is periodically drained to 4 packets.  In FILTER mode the Kalman filter
- * replaces the window entirely, so the periodic self-mutilation loses its
- * mathematical necessity.
+ * is periodically drained to 4 packets.  KCC's Kalman filter replaces the
+ * window entirely, so the periodic self-mutilation loses its mathematical
+ * necessity in both RTT modes.
  *
  * Mode 0: Traditional PROBE_RTT -- every 10 s, cwnd is clamped
  *      to 4 packets for ~200 ms to drain the pipe and measure min_rtt.
  *      This causes a periodic throughput cliff (the BBR "sawtooth").
  *
- * Mode 1 (decouple, default): When kcc_rtt_mode == FILTER, the PROBE_RTT entry
+ * Mode 1 (decouple, default): PROBE_RTT entry is gated on Kalman health.
  *      trigger evaluates Kalman filter health via kcc_kalman_needs_recalibration():
  *
  *      - Kalman healthy (p_est <= kcc_recal_p_est_thresh):
@@ -7642,11 +7726,9 @@ module_param_cb(kcc_rtt_mode, &kcc_param_ops, &kcc_rtt_mode, 0644); /* [T_prop] 
  *        resumes automatically -- an "on-demand" calibration rather than
  *        a "blind periodic" one.
  *
- *      Requires kcc_rtt_mode == 1 to take effect.  No-op in MIN mode.
- *
  * Runtime switch: echo {0,1} > /proc/sys/net/kcc/kcc_probe_rtt_decouple
  */
-static int kcc_probe_rtt_decouple = 1;         /* [T_prop] PROBE_RTT decouple mode: 1 = skip PROBE_RTT when kcc_rtt_mode==FILTER and Kalman is healthy (p_est <= kcc_recal_p_est_thresh); eliminates the periodic throughput cliff of BBR's PROBE_RTT; 0 = traditional periodic PROBE_RTT; KCC-only: kernel BBR always uses periodic PROBE_RTT; range [0, 1], BBR default: N/A (always periodic) */
+static int kcc_probe_rtt_decouple = 1;         /* [T_prop] PROBE_RTT decouple mode: 1 = skip PROBE_RTT when Kalman is healthy (p_est <= kcc_recal_p_est_thresh), independent of kcc_rtt_mode; eliminates the periodic throughput cliff of BBR's PROBE_RTT; 0 = traditional periodic PROBE_RTT; KCC-only: kernel BBR always uses periodic PROBE_RTT; range [0, 1], BBR default: N/A (always periodic) */
 module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple, 0644); /* [T_prop] sysctl: kcc_probe_rtt_decouple */
 /*
  * [K] kcc_recal_p_est_thresh -- Kalman error-covariance threshold for
@@ -8239,7 +8321,7 @@ static u32 kcc_full_bw_thresh_val;                         /* [K] full-BW detect
 static u32 kcc_full_bw_cnt_val;                            /* [K] clamped full-BW round count */
 
 static u32 kcc_kalman_p_est_max_val;                       /* [K] clamped p_est max */
-static u32 kcc_kalman_converged_val;                  /* [K] computed convergence threshold in p_est units = K_thresh * R_kcc */
+static u32 kcc_kalman_converged_val;                  /* [K] computed convergence threshold in p_est units = K_thresh * R_kcc − Q */
 static u32 kcc_recal_p_est_thresh_val;                     /* [K] clamped recalibration p_est threshold */
 
 static u32 kcc_kalman_q_boost_thresh_val;                    /* [K] computed Q-boost threshold */
@@ -8563,7 +8645,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kalman_saturation_thresh = min_t(int, kcc_kalman_saturation_thresh,
         kcc_kalman_drift_thresh * KCC_DRIFT_TIER2_MULT - 1);
     kcc_alone_exit_thresh = clamp(kcc_alone_exit_thresh, 1, 255);       /* [T_queue] alone-mode exit hysteresis */
-    kcc_rtt_mode = clamp(kcc_rtt_mode, 0, 1);                            /* [T_prop] RTT mode: FILTER(1) or MIN(0) */
+    kcc_rtt_mode = clamp(kcc_rtt_mode, 0, 2);                            /* [T_prop] RTT mode: 2=BBR, 1=FILTER, 0=MIN */
     kcc_probe_rtt_decouple = clamp(kcc_probe_rtt_decouple, 0, 1);        /* [T_prop] PROBE_RTT decouple flag */
     kcc_alone_bypass_lt_bw = clamp(kcc_alone_bypass_lt_bw, 0, 1);        /* [T_queue] alone-mode bypass LT BW flag */
     kcc_kalman_scale = clamp(kcc_kalman_scale, 64, 1048576);              /* [K] Kalman scale factor */
@@ -8571,7 +8653,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Enforce: scale^2 > p_est_max (prevents overflow in innov^2/scale^2 division).
      * Without this cross-validation, an operator could independently set
      * p_est_max > scale^2, violating the arithmetic invariant documented at
-     * L7451 (scale^2 > max(Q,R,P) prevents overflow in innov^2/scale^2 division) and creating a latent u64 overflow risk. */
+     * L7482 (scale^2 > max(Q,R,P) prevents overflow in innov^2/scale^2 division) and creating a latent u64 overflow risk. */
     kcc_kalman_p_est_max = min_t(int, kcc_kalman_p_est_max,
         (int)(((u64)kcc_kalman_scale * (u64)kcc_kalman_scale) - 1));
 
@@ -8754,9 +8836,10 @@ static void kcc_init_module_params(void)                          /* clamp all p
             kcc_kalman_converged_val = U32_MAX;  /* overflow safe: always-converged */
         } else {
             kcc_kalman_converged_val = (u32)div_u64(_tmp * _scale_sq, 1000000);
-            /* Subtract Q: p_est = p_pred − Q  (Q << R, preserved even at extremes) */
-            if (kcc_kalman_converged_val > (u32)kcc_kalman_q_val)
-                kcc_kalman_converged_val -= (u32)kcc_kalman_q_val;
+            /* Subtract Q: p_est = p_pred − Q.  If p_pred ≤ Q, the subtraction
+             * underflows below 1; the final max_t(u32,...,1) clamp handles this
+             * correctly (yields converged_val=1, so convergence is never declared). */
+            kcc_kalman_converged_val = (u32)((s64)kcc_kalman_converged_val - (s64)kcc_kalman_q_val);
         }
     }
     kcc_kalman_converged_val = max_t(u32, kcc_kalman_converged_val, 1);
@@ -9597,20 +9680,16 @@ KCC_KFUNC void kcc_cwnd_event(struct sock* sk, enum tcp_ca_event event)   /* [T_
  * @sk:  TCP socket.
  * @ext: extended state (may be NULL if allocation failed).
  *
+ * The RTT source is controlled exclusively by kcc_rtt_mode.
+ * alone_on_path does NOT affect model_rtt (it only controls ECN/LT-BW bypass).
+ *
  * Priority:
- *   0. If alone_on_path: return min_rtt_us -- pure BBR minimum for
- *      single-flow scenarios, bypassing all Kalman logic.
- *   1. If Kalman filter has converged (x_est valid + sample_cnt >= min_samples)
- *      and kcc_rtt_mode == 1 (FILTER, default):
- *      return x_est_us directly -- faster adaptation to abrupt path changes
- *      (route failover, LEO handover, mobile cell switch); Kalman's
- *      outlier gating and adaptive noise estimation prevent queue-bloat
- *      from polluting the estimate.
- *   2. If Kalman filter has converged and kcc_rtt_mode == 0 (MIN):
- *      return min(x_est, min_rtt_us).
- *      The min_rtt clamp prevents any Kalman inflation but may stall BDP
- *      after a real path-latency increase (e.g., BGP reroute).
- *   3. Otherwise: return the sliding-window min_rtt_us.
+ *   0. kcc_rtt_mode == 2 (BBR-pure): return min_rtt_us.
+ *      No Kalman; pure BBR windowed minimum.
+ *   1. kcc_rtt_mode == 1 (FILTER, default): return x_est_us
+ *      when converged, else min_rtt_us (fallback).
+ *   2. kcc_rtt_mode == 0 (MIN): return min(x_est, min_rtt_us)
+ *      when converged, else min_rtt_us (fallback).
  */
 static u32 kcc_get_model_rtt(const struct sock* sk,                    /* [T_prop] return propagation RTT for BDP */
     const struct kcc_ext* ext)                                         /* [K][T_prop] extended state for Kalman RTT */
@@ -9618,13 +9697,12 @@ static u32 kcc_get_model_rtt(const struct sock* sk,                    /* [T_pro
     const struct kcc* kcc = (const struct kcc*)inet_csk_ca(sk);        /* [T_prop] per-connection KCC state */
 
     /*
-     * When alone on path: use min_rtt_us directly, matching BBR's pure
-     * minimum.  The Kalman smoothed estimate has a small positive bias
-     * from one-sided measurement noise (queues only add, never subtract),
-     * which inflates BDP and causes deeper queues in single-flow scenarios.
+     * Mode 2 (BBR-pure): always use min_rtt_us.
+     * User explicitly chooses BBR's exact windowed minimum.
+     * No Kalman involvement; no alone_on_path override needed.
      */
-    if (kcc->alone_on_path) {
-        return kcc->min_rtt_us;                                        /* [T_prop] pure propagation floor */
+    if (kcc_rtt_mode == 2) {
+        return kcc->min_rtt_us;                                        /* [T_prop] pure BBR floor */
     }
 
     if (unlikely(!ext || !ext->x_est || ext->sample_cnt < kcc_kalman_min_samples_val)) {
@@ -9633,54 +9711,14 @@ static u32 kcc_get_model_rtt(const struct sock* sk,                    /* [T_pro
 
     {
         u32 x_est_us = ext->x_est >> kcc_kalman_scale_shift_val;       /* [K] descale Kalman estimate to us */
-        /*
-         * THREE-COMPONENT MODEL: T_prop Selection for BDP.
-         *
-         *   RTT_obs = T_prop + T_queue + T_noise
-         *
-         *   The BDP formula requires T_prop alone (noise and queue must be
-         *   excluded).  KCC uses a maximin strategy: model_rtt takes the
-         *   MINIMUM of two independent T_prop estimates, ensuring the BDP
-         *   is conservative (biased low, never inflated by T_queue).
-         *
-         * [T_prop] Estimate 1: x_est_us -- Kalman filter, directional update.
-         *   Only RTT decreases enter the filter, so x_est never drifts
-         *   upward from T_queue contamination.
-         *
-         * [T_prop] Estimate 2: min_rtt_us -- windowed minimum of recent RTTs.
-         *   Provides a hard floor; updated on every lower sample.  May be
-         *   inflated under persistent queue but serves as upper safety bound.
-         *
-         * In FILTER mode (default): model_rtt = x_est_us -- faster path-change
-         * adaptation, with Kalman outlier gating and adaptive Q/R as defense.
-         * In MIN mode: model_rtt = min_t(x_est_us, min_rtt_us) -- the
-         * windowed-min clamp prevents BDP inflation but may stall after a
-         * real RTT increase (e.g., BGP reroute from 50→100 ms).
-         *
-         * After a path increase (e.g., 50ms→100ms BGP reroute), the directional
-         * update skips positive innovations, causing x_est to lag.  Maximum
- *          under-utilisation duration: drift correction Tier 2 activates after
- *          drift_thresh * 8 = 16 * 8 = 128 consecutive positive skips
- *          (P < 2^-128 under i.i.d. symmetric noise — statistical certainty
- *          of genuine path change).  At 100ms RTT, the first correction arrives
- *          at 12.8s.  The correction is dampened (K*corr/8), so convergence
- *          ratchets: each 128-RTT cycle applies one correction of corr/8,
- *          converging geometrically.  For quiet paths (jitter < min_rtt/8),
- *          Tier 1 activates at drift_thresh=16 skips with corr/4, providing
- *          8x faster convergence.  Additionally, the smart recalibration
- *          mechanism (p_est exceeding kcc_recal_p_est_thresh) triggers a
- *          traditional PROBE_RTT drain on the next interval boundary, directly
- *          measuring the new min_rtt and reseeding x_est — providing full
- *          convergence within at most the PROBE_RTT interval (base 10s).
-         */
         u32 model_rtt;                                                 /* [T_prop] selected propagation estimate */
-        if (kcc_rtt_mode) {
-            model_rtt = x_est_us;                                      /* [K][T_prop] Kalman propagation estimate */
+        if (kcc_rtt_mode == 1) {
+            model_rtt = x_est_us;                                      /* [K][T_prop] Kalman propagation estimate (FILTER) */
         }
         else {
+            /* kcc_rtt_mode == 0: MIN */
             model_rtt = min_t(u32, x_est_us, kcc->min_rtt_us);         /* [T_prop] min of Kalman and windowed min_rtt */
         }
-
         return model_rtt;                                              /* [T_prop] return selected estimate */
     }
 }
@@ -12286,13 +12324,21 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         }
         /* [T_queue] ---- Update EWMA queuing delay ---- */
         /*
-         * qdelay_instant = max(0, (z - x_est) / scale)
-         *   i.e., observed RTT minus estimated prop delay, zero if negative.
+         * qdelay_instant = max(0, (z - t_prop_scaled) / scale)
+         * Uses the mode-specific T_prop estimate (in scaled units):
+         *   FILTER (mode 1): t_prop = ext->x_est
+         *   MIN/BBR (mode 0/2): t_prop = min(ext->x_est, min_rtt * scale)
+         *     — min_rtt_us may capture better T_prop during RTT decreases;
+         *     — x_est is lower (safer) under high pressure, so min() is always
+         *       the most conservative (smallest T_prop → largest qdelay).
          * qdelay_avg = (qdelay_avg * num + instant) / den
          */
         {
-            u32 qdelay_instant = (z > ext->x_est) ?                                                                                                                          /* [T_queue] if measurement > estimate */
-                (u32)((z - ext->x_est) >> kcc_kalman_scale_shift_val) : 0;                                                                                                 /* u64 division, cast to u32 after */
+            u64 t_prop_scaled = (kcc_rtt_mode == 1) ? (u64)ext->x_est                                                               /* FILTER: use Kalman estimate directly */
+                : min_t(u64, (u64)ext->x_est,                                                                                       /* MIN/BBR: min of Kalman and windowed min */
+                    (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val);                                                              /* min_rtt_us to scaled units */
+            u32 qdelay_instant = (z > t_prop_scaled) ? (u32)((z - t_prop_scaled) >>                                                                                                  /* [T_queue] observation minus best estimate */
+                kcc_kalman_scale_shift_val) : 0;
             if (ext->sample_cnt == 1) {
                 ext->qdelay_avg = qdelay_instant;                                                                                                                               /* init qdelay EWMA directly */
             }
@@ -12628,21 +12674,29 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
       * after major path changes -- when it does, a single PROBE_RTT drain
       * restores the baseline.  This matrix implements that adaptive logic.
       *
-      *   kcc_rtt_mode | kcc_probe_rtt_decouple | Action
+      *   kcc_probe_rtt_decouple | Action
       *   --------------------------------------------------------------
-      *   MIN (0)      | any                    | Traditional PROBE_RTT:
-      *               |                        | enter, drain to 4 pkts.
-      *   FILTER (1)   | 0 (disabled)          | Traditional PROBE_RTT:
-      *               |                        | enter, drain to 4 pkts.
-      *   FILTER (1)   | 1 (enabled)           | Smart decoupling:
-      *               |                        |   a) Kalman healthy:
-      *               |                        |      suppress PROBE_RTT
-      *               |                        |      (no throughput cliff).
-      *               |                        |   b) Kalman diverged:
-      *               |                        |      enter PROBE_RTT as
-      *               |                        |      a safety net -- single
-      *               |                        |      drain restores the
-      *               |                        |      filter baseline.
+      *   0 (disabled)           | Traditional PROBE_RTT:
+      *                          | enter, drain to 4 pkts.
+      *   1 (enabled)            | Smart decoupling:
+      *                          |   a) Kalman healthy:
+      *                          |      suppress PROBE_RTT
+      *                          |      (no throughput cliff).
+      *                          |   b) Kalman diverged:
+      *                          |      enter PROBE_RTT as
+      *                          |      a safety net -- single
+      *                          |      drain restores the
+      *                          |      filter baseline.
+      *
+      * Works in all kcc_rtt_mode values (BBR/FILTER/MIN).
+      * In FILTER mode, x_est provides the BDP baseline during suppression.
+      * In MIN mode, min_rtt_us may age slightly during suppression, but
+      * the Kalman recall threshold (p_est > recal_p_est_thresh) detects
+      * divergence and triggers a safety-net PROBE_RTT to refresh min_rtt.
+      * In BBR mode (kcc_rtt_mode==2), PROBE_RTT decouple leaves min_rtt_us
+      * unrefreshed -- set kcc_probe_rtt_decouple=0 for standard BBR-periodic
+      * probing.  The decouple decision is orthogonal to the RTT source
+      * selection.
       *
       * When suppressed: the Kalman filter continuously tracks true
       * propagation delay via outlier gating and adaptive noise
@@ -12661,7 +12715,7 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
       */
     if (unlikely(filter_expired && !kcc->idle_restart
         && kcc->mode != KCC_PROBE_RTT)) {
-        if (kcc_rtt_mode && kcc_probe_rtt_decouple                                                                       /* FILTER + decouple active AND Kalman alive AND */
+        if (kcc_probe_rtt_decouple                                                                               /* decouple active AND Kalman alive AND */
             && ext && !kcc_kalman_needs_recalibration(ext)) {           /* not diverged: ext==NULL => no Kalman => never skip, PROBE_RTT keeps min_rtt fresh in degraded fallback */
             goto skip_probe_rtt;                                                                                              /* suppress PROBE_RTT: no throughput cliff */
         }
@@ -13559,9 +13613,8 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,    /
  * falsely triggers alone-mode exit.
  *
  * When alone_on_path is set:
- *   - kcc_get_model_rtt returns kcc->min_rtt_us (BBR-style exact min),
- *     bypassing the Kalman smoothed estimate which has a small positive
- *     bias from one-sided measurement noise.
+ *   - kcc_get_model_rtt uses kcc_rtt_mode as usual (alone_on_path does
+ *     NOT override model_rtt; the user's mode selection takes priority).
  *   - kcc_ecn_backoff returns immediately (no ECN reaction needed).
  *
  * The flag is cleared when any queue, ECN, or aggregation signal
@@ -14410,7 +14463,7 @@ static struct ctl_table kcc_ctl_table[] = {
     /* Dynamic qdelay/jitter thresholds (permyriad of min_rtt_us, with absolute floor) [T_queue][T_noise] */
     {.procname = "kcc_qdelay_clean_bp",           .data = &kcc_qdelay_clean_bp,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000] clean threshold (permyriad of min_rtt_us); 1000=10% BDP */
     {.procname = "kcc_qdelay_cong_bp",            .data = &kcc_qdelay_cong_bp,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000] congestion threshold (permyriad of min_rtt_us); 2500=25% BDP */
-    {.procname = "kcc_qdelay_floor_us",           .data = &kcc_qdelay_floor_us,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] absolute floor; default 500us */
+    {.procname = "kcc_qdelay_floor_us",           .data = &kcc_qdelay_floor_us,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] absolute floor; default 500us */
     /* Long RTT threshold [T_prop] */
     {.procname = "kcc_probe_rtt_long_rtt_us",   .data = &kcc_probe_rtt_long_rtt_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10M us] long-RTT threshold; default 20,000us */
     /* LT BW parameters */
@@ -14452,6 +14505,7 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_alone_exit_thresh",        .data = &kcc_alone_exit_thresh,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..255] consecutive alone_eval failures before exit; default 3 */
     {.procname = "kcc_alone_agg_state_level",    .data = &kcc_alone_agg_state_level,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..2] alone mode agg strictness; default 1 */
     {.procname = "kcc_alone_bypass_ecn",         .data = &kcc_alone_bypass_ecn,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode ECN bypass; 0=honour ECN (default) */
+    {.procname = "kcc_alone_bypass_lt_bw",       .data = &kcc_alone_bypass_lt_bw,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode LT BW bypass; 1=bypass (default) */
     {.procname = "kcc_ecn_enable",              .data = &kcc_ecn_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] ECN master switch; default 0=disabled (directional gate pre-empts; see §ECN block comment); only enable on single-switch known-θ paths */
     {.procname = "kcc_ecn_backoff_num",         .data = &kcc_ecn_backoff_num,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] ECN backoff percentage numerator; default 20 */
     {.procname = "kcc_ecn_backoff_den",         .data = &kcc_ecn_backoff_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] ECN backoff percentage denominator; default 100 */
@@ -14513,8 +14567,8 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_lt_bw_ema_den",         .data = &kcc_lt_bw_ema_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] LT BW EMA denominator; default 2 (1/2=EMA) */
     {.procname = "kcc_kalman_noise_avg_num",  .data = &kcc_kalman_noise_avg_num,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] noise averaging numerator (mode=2); default 1 */
     {.procname = "kcc_kalman_noise_avg_den",  .data = &kcc_kalman_noise_avg_den,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] noise averaging denominator (mode=2); default 2 */
-    {.procname = "kcc_rtt_mode",              .data = &kcc_rtt_mode,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] model RTT strategy: 1=FILTER(default), 0=MIN */
-    {.procname = "kcc_probe_rtt_decouple",    .data = &kcc_probe_rtt_decouple,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] skip PROBE_RTT when FILTER mode active; default 1 */
+    {.procname = "kcc_rtt_mode",              .data = &kcc_rtt_mode,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1/2] model RTT strategy: 2=BBR, 1=FILTER(default), 0=MIN */
+    {.procname = "kcc_probe_rtt_decouple",    .data = &kcc_probe_rtt_decouple,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] skip PROBE_RTT when Kalman healthy (all rtt_modes); default 1 */
     {.procname = "kcc_tso_segs_low",          .data = &kcc_tso_segs_low,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] TSO segments at low pacing rate; default 1 */
     {.procname = "kcc_tso_segs_default",      .data = &kcc_tso_segs_default,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] TSO segments at normal pacing rate; BBR default: 2 */
     {.procname = "kcc_extra_acked_win_rtts_max", .data = &kcc_extra_acked_win_rtts_max, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535 RTTs] max dual-window RTTs before rotation; default 31 */
@@ -14609,7 +14663,7 @@ static DEFINE_KFUNC_BTF_ID_SET(&tcp_kcc_check_kfunc_ids, tcp_kcc_kfunc_btf_set);
  *   1. ident         source IP:port -> dest IP:port
  *   2. min_rtt       windowed-minimum RTT (us), the BBR-compatible baseline [T_prop]
  *   3. mode          current FSM state (STARTUP/DRAIN/PROBE_BW/PROBE_RTT)
- *   4. rtt_m         RTT estimation mode: F=FILTER (Kalman [K]), M=MIN (BBR window)
+ *   4. rtt_m         RTT estimation mode: B=BBR (min_rtt [T_prop]), F=FILTER (Kalman [K]), M=MIN (min comp)
  *   5. p_est         Kalman error covariance (low = converged, >recal_thresh = diverged) [K]
  *   6. samp          accepted Kalman sample count (converged >= min_samples) [K]
  *   7. x_est         Kalman propagation-delay estimate (us); 0 = cold-start [T_prop][K]
@@ -14690,13 +14744,13 @@ static int kcc_status_show(struct seq_file* m, void* v)                  /* seq_
         }
 
         seq_printf(m,
-            "  %-7u  %-9s  %-5s  %-5u  %-4u  %-5u  %-6u  %-6u  %4u  %-8s  %-5u  %-2u  %-5u  %-3u\n",
+            "  %-7u  %-9s  %-5c  %-5u  %-4u  %-5u  %-6u  %-6u  %4u  %-8s  %-5u  %-2u  %-5u  %-3u\n",
             kcc->min_rtt_us,                                               /* col 2: min RTT in us [T_prop] */
             kcc->mode == KCC_STARTUP ? "STARTUP" :                        /* col 3: FSM mode string */
             kcc->mode == KCC_DRAIN ? "DRAIN  " :
             kcc->mode == KCC_PROBE_BW ? "PROBE_BW" :
             kcc->mode == KCC_PROBE_RTT ? "PROBE_RTT" : "?",
-            kcc_rtt_mode ? "F" : "M",                                     /* col 4: RTT mode: F=Filter [K], M=Min */
+            kcc_rtt_mode == 2 ? 'B' : kcc_rtt_mode ? 'F' : 'M',                  /* col 4: RTT mode: B=BBR, F=Filter, M=Min */
             ext->p_est,                                                    /* col 5: Kalman error covariance [K] */
             ext->sample_cnt,                                               /* col 6: accepted Kalman sample count [K] */
             ext->x_est >> kcc_kalman_scale_shift_val,                    /* col 7: Kalman x_est in us [T_prop][K] */
